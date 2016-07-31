@@ -19,18 +19,19 @@
 #define NFSD_MAY_TRUNC			0x010
 #define NFSD_MAY_LOCK			0x020
 #define NFSD_MAY_MASK			0x03f
+#define NFSD_MAY_CREATE_FILE		0x103 /* == MAY_{EXEC|WRITE|CREATE_FILE} */
+#define NFSD_MAY_CREATE_DIR		0x203 /* == MAY_{EXEC|WRITE|CREATE_DIR} */
 
 /* extra hints to permission and open routines: */
-#define NFSD_MAY_OWNER_OVERRIDE		0x040
-#define NFSD_MAY_LOCAL_ACCESS		0x080 /* for device special files */
-#define NFSD_MAY_BYPASS_GSS_ON_ROOT	0x100
-#define NFSD_MAY_NOT_BREAK_LEASE	0x200
-#define NFSD_MAY_BYPASS_GSS		0x400
-#define NFSD_MAY_READ_IF_EXEC		0x800
+#define NFSD_MAY_OWNER_OVERRIDE		0x04000
+#define NFSD_MAY_LOCAL_ACCESS		0x08000 /* for device special files */
+#define NFSD_MAY_BYPASS_GSS_ON_ROOT	0x10000
+#define NFSD_MAY_NOT_BREAK_LEASE	0x20000
+#define NFSD_MAY_BYPASS_GSS		0x40000
+#define NFSD_MAY_READ_IF_EXEC		0x80000
 
-#define NFSD_MAY_64BIT_COOKIE		0x1000 /* 64 bit readdir cookies for >= NFSv3 */
+#define NFSD_MAY_64BIT_COOKIE		0x100000 /* 64 bit readdir cookies for >= NFSv3 */
 
-#define NFSD_MAY_CREATE		(NFSD_MAY_EXEC|NFSD_MAY_WRITE)
 #define NFSD_MAY_REMOVE		(NFSD_MAY_EXEC|NFSD_MAY_WRITE|NFSD_MAY_TRUNC)
 
 /*
@@ -39,8 +40,6 @@
 typedef int (*nfsd_filldir_t)(void *, const char *, int, loff_t, u64, unsigned);
 
 /* nfsd/vfs.c */
-int		nfsd_racache_init(int);
-void		nfsd_racache_shutdown(void);
 int		nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
 		                struct svc_export **expp);
 __be32		nfsd_lookup(struct svc_rqst *, struct svc_fh *,
@@ -69,21 +68,23 @@ __be32		do_nfsd_create(struct svc_rqst *, struct svc_fh *,
 __be32		nfsd_commit(struct svc_rqst *, struct svc_fh *,
 				loff_t, unsigned long);
 #endif /* CONFIG_NFSD_V3 */
+int		nfsd_open_break_lease(struct inode *, int);
 __be32		nfsd_open(struct svc_rqst *, struct svc_fh *, umode_t,
 				int, struct file **);
-void		nfsd_close(struct file *);
-struct raparms;
-__be32		nfsd_get_tmp_read_open(struct svc_rqst *, struct svc_fh *,
-				struct file **, struct raparms **);
-void		nfsd_put_tmp_read_open(struct file *, struct raparms *);
+__be32		nfsd_open_verified(struct svc_rqst *, struct svc_fh *, umode_t,
+				int, struct file **);
 __be32		nfsd_splice_read(struct svc_rqst *,
 				struct file *, loff_t, unsigned long *);
 __be32		nfsd_readv(struct file *, loff_t, struct kvec *, int,
 				unsigned long *);
 __be32 		nfsd_read(struct svc_rqst *, struct svc_fh *,
 				loff_t, struct kvec *, int, unsigned long *);
-__be32 		nfsd_write(struct svc_rqst *, struct svc_fh *,struct file *,
+__be32 		nfsd_write(struct svc_rqst *, struct svc_fh *,
 				loff_t, struct kvec *,int, unsigned long *, int *);
+__be32		nfsd_vfs_write(struct svc_rqst *rqstp, struct svc_fh *fhp,
+				struct file *file, loff_t offset,
+				struct kvec *vec, int vlen, unsigned long *cnt,
+				int *stablep);
 __be32		nfsd_readlink(struct svc_rqst *, struct svc_fh *,
 				char *, int *);
 __be32		nfsd_symlink(struct svc_rqst *, struct svc_fh *,
@@ -109,14 +110,14 @@ static inline int fh_want_write(struct svc_fh *fh)
 	int ret = mnt_want_write(fh->fh_export->ex_path.mnt);
 
 	if (!ret)
-		fh->fh_want_write = 1;
+		fh->fh_want_write = true;
 	return ret;
 }
 
 static inline void fh_drop_write(struct svc_fh *fh)
 {
 	if (fh->fh_want_write) {
-		fh->fh_want_write = 0;
+		fh->fh_want_write = false;
 		mnt_drop_write(fh->fh_export->ex_path.mnt);
 	}
 }

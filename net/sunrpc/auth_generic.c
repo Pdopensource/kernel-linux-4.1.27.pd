@@ -38,6 +38,13 @@ struct rpc_cred *rpc_lookup_cred(void)
 }
 EXPORT_SYMBOL_GPL(rpc_lookup_cred);
 
+struct rpc_cred *
+rpc_lookup_generic_cred(struct auth_cred *acred, int flags, gfp_t gfp)
+{
+	return rpcauth_lookup_credcache(&generic_auth, acred, flags, gfp);
+}
+EXPORT_SYMBOL_GPL(rpc_lookup_generic_cred);
+
 struct rpc_cred *rpc_lookup_cred_nonblock(void)
 {
 	return rpcauth_lookupcred(&generic_auth, RPCAUTH_LOOKUP_RCU);
@@ -77,15 +84,15 @@ static struct rpc_cred *generic_bind_cred(struct rpc_task *task,
 static struct rpc_cred *
 generic_lookup_cred(struct rpc_auth *auth, struct auth_cred *acred, int flags)
 {
-	return rpcauth_lookup_credcache(&generic_auth, acred, flags);
+	return rpcauth_lookup_credcache(&generic_auth, acred, flags, GFP_KERNEL);
 }
 
 static struct rpc_cred *
-generic_create_cred(struct rpc_auth *auth, struct auth_cred *acred, int flags)
+generic_create_cred(struct rpc_auth *auth, struct auth_cred *acred, int flags, gfp_t gfp)
 {
 	struct generic_cred *gcred;
 
-	gcred = kmalloc(sizeof(*gcred), GFP_KERNEL);
+	gcred = kmalloc(sizeof(*gcred), gfp);
 	if (gcred == NULL)
 		return ERR_PTR(-ENOMEM);
 
@@ -281,10 +288,40 @@ static bool generic_key_to_expire(struct rpc_cred *cred)
 	return ret;
 }
 
+static bool generic_map_to_svc_cred(struct rpc_auth *auth,
+				    struct rpc_cred *cred,
+				    struct svc_cred *svc)
+{
+	struct auth_cred *acred = &container_of(cred, struct generic_cred,
+						gc_base)->acred;
+
+	get_rpccred(cred);
+
+	dprintk("%s: cred flavor=%u, uid=%u, gid=%u\n", __func__,
+		auth->au_flavor, acred->uid.val, acred->gid.val);
+
+	svc->cr_uid = acred->uid;
+	svc->cr_gid = acred->gid;
+	svc->cr_flavor = auth->au_flavor;
+	svc->cr_principal = NULL;
+	svc->cr_gss_mech = NULL;
+	if (acred->group_info)
+		svc->cr_group_info = get_group_info(acred->group_info);
+	if (acred->principal) {
+		svc->cr_principal = kzalloc(strlen(acred->principal) + 1,
+					GFP_KERNEL);
+		strcpy(svc->cr_principal, acred->principal);
+	}
+	put_rpccred(cred);
+
+	return true;
+}
+
 static const struct rpc_credops generic_credops = {
 	.cr_name = "Generic cred",
 	.crdestroy = generic_destroy_cred,
 	.crbind = generic_bind_cred,
 	.crmatch = generic_match,
 	.crkey_to_expire = generic_key_to_expire,
+	.crmap_to_svc_cred = generic_map_to_svc_cred,
 };

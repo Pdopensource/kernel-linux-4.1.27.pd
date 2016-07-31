@@ -22,6 +22,7 @@
 #include "cache.h"
 #include "vfs.h"
 #include "netns.h"
+#include "filecache.h"
 
 #define NFSDDBG_FACILITY	NFSDDBG_SVC
 
@@ -180,7 +181,7 @@ int nfsd_nrthreads(struct net *net)
 
 	mutex_lock(&nfsd_mutex);
 	if (nn->nfsd_serv)
-		rv = nn->nfsd_serv->sv_nrthreads;
+		rv = svc_get_num_threads(nn->nfsd_serv, NULL);
 	mutex_unlock(&nfsd_mutex);
 	return rv;
 }
@@ -215,22 +216,17 @@ static int nfsd_startup_generic(int nrservs)
 	if (nfsd_users++)
 		return 0;
 
-	/*
-	 * Readahead param cache - will no-op if it already exists.
-	 * (Note therefore results will be suboptimal if number of
-	 * threads is modified after nfsd start.)
-	 */
-	ret = nfsd_racache_init(2*nrservs);
+	ret = nfsd_file_cache_init();
 	if (ret)
 		goto dec_users;
 
 	ret = nfs4_state_start();
 	if (ret)
-		goto out_racache;
+		goto out_file_cache;
 	return 0;
 
-out_racache:
-	nfsd_racache_shutdown();
+out_file_cache:
+	nfsd_file_cache_shutdown();
 dec_users:
 	nfsd_users--;
 	return ret;
@@ -242,11 +238,26 @@ static void nfsd_shutdown_generic(void)
 		return;
 
 	nfs4_state_shutdown();
-	nfsd_racache_shutdown();
+	nfsd_file_cache_shutdown();
 }
+
+/*
+ * Allow admin to disable lockd. This would typically be used to allow (e.g.)
+ * a userspace NLM server of some sort to be used.
+ */
+static bool nfsd_disable_lockd = false;
+module_param(nfsd_disable_lockd, bool, 0644);
+MODULE_PARM_DESC(nfsd_disable_lockd, "Allow lockd to be manually disabled.");
+
+static int nfsd_max_rpcs_per_clnt = 0;
+module_param(nfsd_max_rpcs_per_clnt, int, 0644);
+MODULE_PARM_DESC(nfsd_max_rpcs_per_xprt, "Maximum concurrent RPCs per client");
 
 static bool nfsd_needs_lockd(void)
 {
+	if (nfsd_disable_lockd)
+		return false;
+
 #if defined(CONFIG_NFSD_V3)
 	return (nfsd_versions[2] != NULL) || (nfsd_versions[3] != NULL);
 #else
@@ -405,7 +416,8 @@ int nfsd_create_serv(struct net *net)
 		nfsd_max_blksize = nfsd_get_default_max_blksize();
 	nfsd_reset_versions();
 	nn->nfsd_serv = svc_create_pooled(&nfsd_program, nfsd_max_blksize,
-				      nfsd_last_thread, nfsd, THIS_MODULE);
+					  nfsd_last_thread, nfsd,
+					  nfsd, THIS_MODULE);
 	if (nn->nfsd_serv == NULL)
 		return -ENOMEM;
 
@@ -435,10 +447,12 @@ int nfsd_get_nrthreads(int n, int *nthreads, struct net *net)
 {
 	int i = 0;
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
+	struct svc_serv *serv = nn->nfsd_serv;
+	struct svc_pool *pool = &serv->sv_pools[0];
 
 	if (nn->nfsd_serv != NULL) {
-		for (i = 0; i < nn->nfsd_serv->sv_nrpools && i < n; i++)
-			nthreads[i] = nn->nfsd_serv->sv_pools[i].sp_nrthreads;
+		for (i = 0; i < serv->sv_nrpools && i < n; i++)
+			nthreads[i] = svc_get_num_threads(serv, &pool[i]);
 	}
 
 	return 0;
@@ -447,7 +461,7 @@ int nfsd_get_nrthreads(int n, int *nthreads, struct net *net)
 void nfsd_destroy(struct net *net)
 {
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
-	int destroy = (nn->nfsd_serv->sv_nrthreads == 1);
+	int destroy = (atomic_read(&nn->nfsd_serv->sv_refcount) == 1);
 
 	if (destroy)
 		svc_shutdown_net(nn->nfsd_serv, net);
@@ -547,7 +561,7 @@ nfsd_svc(int nrservs, struct net *net)
 	 * we don't want to count in the return value,
 	 * so subtract 1
 	 */
-	error = nn->nfsd_serv->sv_nrthreads - 1;
+	error = svc_get_num_threads(nn->nfsd_serv, NULL) - 1;
 out_shutdown:
 	if (error < 0 && !nfsd_up_before)
 		nfsd_shutdown_net(net);
@@ -604,6 +618,7 @@ nfsd(void *vrqstp)
 	for (;;) {
 		/* Update sv_maxconn if it has changed */
 		rqstp->rq_server->sv_maxconn = nn->max_connections;
+		rqstp->rq_server->sv_max_inflight = nfsd_max_rpcs_per_clnt;
 
 		/*
 		 * Find a socket with data available and call its
@@ -625,7 +640,7 @@ nfsd(void *vrqstp)
 	nfsdstats.th_cnt --;
 
 out:
-	rqstp->rq_server = NULL;
+	svc_get(rqstp->rq_server);
 
 	/* Release the thread */
 	svc_exit_thread(rqstp);

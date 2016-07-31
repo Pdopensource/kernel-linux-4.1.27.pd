@@ -643,6 +643,8 @@ static bool cache_defer_req(struct cache_req *req, struct cache_head *item)
 		if (!test_bit(CACHE_PENDING, &item->flags))
 			return false;
 	}
+	if (!req->defer)
+		return false;
 	dreq = req->defer(req);
 	if (dreq == NULL)
 		return false;
@@ -1451,6 +1453,9 @@ static ssize_t write_flush(struct file *file, const char __user *buf,
 	cd->flush_time = get_expiry(&bp);
 	cd->nextcheck = seconds_since_boot();
 	cache_flush();
+
+	if (cd->flush)
+		cd->flush();
 
 	*ppos += count;
 	return count;

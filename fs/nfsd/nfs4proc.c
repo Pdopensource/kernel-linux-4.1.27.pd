@@ -110,7 +110,7 @@ check_attr_support(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	 * in current environment or not.
 	 */
 	if (bmval[0] & FATTR4_WORD0_ACL) {
-		if (!IS_POSIXACL(d_inode(dentry)))
+		if (!IS_ACL(d_inode(dentry)))
 			return nfserr_attrnotsupp;
 	}
 
@@ -159,12 +159,12 @@ is_create_with_attrs(struct nfsd4_open *open)
  * in the returned attr bitmap.
  */
 static void
-do_set_nfs4_acl(struct svc_rqst *rqstp, struct svc_fh *fhp,
-		struct nfs4_acl *acl, u32 *bmval)
+do_set_acl(struct svc_rqst *rqstp, struct svc_fh *fhp, struct richacl *acl,
+	   u32 *bmval)
 {
 	__be32 status;
 
-	status = nfsd4_set_nfs4_acl(rqstp, fhp, acl);
+	status = nfsd4_set_acl(rqstp, fhp, acl);
 	if (status)
 		/*
 		 * We should probably fail the whole open at this point,
@@ -299,7 +299,7 @@ do_open_lookup(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate, stru
 		goto out;
 
 	if (is_create_with_attrs(open) && open->op_acl != NULL)
-		do_set_nfs4_acl(rqstp, *resfh, open->op_acl, open->op_bmval);
+		do_set_acl(rqstp, *resfh, open->op_acl, open->op_bmval);
 
 	nfsd4_set_open_owner_reply_cache(cstate, open, *resfh);
 	accmode = NFSD_MAY_NOP;
@@ -601,14 +601,15 @@ static __be32
 nfsd4_create(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	     struct nfsd4_create *create)
 {
+	int access = create->cr_type == NF4DIR ?
+		NFSD_MAY_CREATE_DIR : NFSD_MAY_CREATE_FILE;
 	struct svc_fh resfh;
 	__be32 status;
 	dev_t rdev;
 
 	fh_init(&resfh, NFS4_FHSIZE);
 
-	status = fh_verify(rqstp, &cstate->current_fh, S_IFDIR,
-			   NFSD_MAY_CREATE);
+	status = fh_verify(rqstp, &cstate->current_fh, S_IFDIR, access);
 	if (status)
 		return status;
 
@@ -674,8 +675,7 @@ nfsd4_create(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 		nfsd4_security_inode_setsecctx(&resfh, &create->cr_label, create->cr_bmval);
 
 	if (create->cr_acl != NULL)
-		do_set_nfs4_acl(rqstp, &resfh, create->cr_acl,
-				create->cr_bmval);
+		do_set_acl(rqstp, &resfh, create->cr_acl, create->cr_bmval);
 
 	fh_unlock(&cstate->current_fh);
 	set_change_info(&create->cr_cinfo, &cstate->current_fh);
@@ -760,9 +760,7 @@ nfsd4_read(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 {
 	__be32 status;
 
-	/* no need to check permission - this will be done in nfsd_read() */
-
-	read->rd_filp = NULL;
+	read->rd_nf = NULL;
 	if (read->rd_offset >= OFFSET_MAX)
 		return nfserr_inval;
 
@@ -778,9 +776,9 @@ nfsd4_read(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 		clear_bit(RQ_SPLICE_OK, &rqstp->rq_flags);
 
 	/* check stateid */
-	if ((status = nfs4_preprocess_stateid_op(SVC_NET(rqstp),
-						 cstate, &read->rd_stateid,
-						 RD_STATE, &read->rd_filp))) {
+	status = nfs4_preprocess_stateid_op(rqstp, cstate, &read->rd_stateid,
+			RD_STATE, &read->rd_nf);
+	if (status) {
 		dprintk("NFSD: nfsd4_read: couldn't process stateid!\n");
 		goto out;
 	}
@@ -925,7 +923,7 @@ nfsd4_setattr(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	int err;
 
 	if (setattr->sa_iattr.ia_valid & ATTR_SIZE) {
-		status = nfs4_preprocess_stateid_op(SVC_NET(rqstp), cstate,
+		status = nfs4_preprocess_stateid_op(rqstp, cstate,
 			&setattr->sa_stateid, WR_STATE, NULL);
 		if (status) {
 			dprintk("NFSD: nfsd4_setattr: couldn't process stateid!\n");
@@ -943,8 +941,8 @@ nfsd4_setattr(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 		goto out;
 
 	if (setattr->sa_acl != NULL)
-		status = nfsd4_set_nfs4_acl(rqstp, &cstate->current_fh,
-					    setattr->sa_acl);
+		status = nfsd4_set_acl(rqstp, &cstate->current_fh,
+				       setattr->sa_acl);
 	if (status)
 		goto out;
 	if (setattr->sa_label.len)
@@ -982,18 +980,16 @@ nfsd4_write(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	    struct nfsd4_write *write)
 {
 	stateid_t *stateid = &write->wr_stateid;
-	struct file *filp = NULL;
+	struct nfsd_file *nf = NULL;
 	__be32 status = nfs_ok;
 	unsigned long cnt;
 	int nvecs;
 
-	/* no need to check permission - this will be done in nfsd_write() */
-
 	if (write->wr_offset >= OFFSET_MAX)
 		return nfserr_inval;
 
-	status = nfs4_preprocess_stateid_op(SVC_NET(rqstp),
-					cstate, stateid, WR_STATE, &filp);
+	status = nfs4_preprocess_stateid_op(rqstp, cstate, stateid, WR_STATE,
+			&nf);
 	if (status) {
 		dprintk("NFSD: nfsd4_write: couldn't process stateid!\n");
 		return status;
@@ -1006,11 +1002,10 @@ nfsd4_write(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	nvecs = fill_in_write_vector(rqstp->rq_vec, write);
 	WARN_ON_ONCE(nvecs > ARRAY_SIZE(rqstp->rq_vec));
 
-	status =  nfsd_write(rqstp, &cstate->current_fh, filp,
-			     write->wr_offset, rqstp->rq_vec, nvecs,
-			     &cnt, &write->wr_how_written);
-	if (filp)
-		fput(filp);
+	status = nfsd_vfs_write(rqstp, &cstate->current_fh, nf->nf_file,
+				write->wr_offset, rqstp->rq_vec, nvecs, &cnt,
+				&write->wr_how_written);
+	nfsd_file_put(nf);
 
 	write->wr_bytes_written = cnt;
 
@@ -1022,23 +1017,21 @@ nfsd4_fallocate(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 		struct nfsd4_fallocate *fallocate, int flags)
 {
 	__be32 status = nfserr_notsupp;
-	struct file *file;
+	struct nfsd_file *nf;
 
-	status = nfs4_preprocess_stateid_op(SVC_NET(rqstp), cstate,
+	status = nfs4_preprocess_stateid_op(rqstp, cstate,
 					    &fallocate->falloc_stateid,
-					    WR_STATE, &file);
+					    WR_STATE, &nf);
 	if (status != nfs_ok) {
 		dprintk("NFSD: nfsd4_fallocate: couldn't process stateid!\n");
 		return status;
 	}
-	if (!file)
-		return nfserr_bad_stateid;
 
-	status = nfsd4_vfs_fallocate(rqstp, &cstate->current_fh, file,
+	status = nfsd4_vfs_fallocate(rqstp, &cstate->current_fh, nf->nf_file,
 				     fallocate->falloc_offset,
 				     fallocate->falloc_length,
 				     flags);
-	fput(file);
+	nfsd_file_put(nf);
 	return status;
 }
 
@@ -1063,17 +1056,15 @@ nfsd4_seek(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 {
 	int whence;
 	__be32 status;
-	struct file *file;
+	struct nfsd_file *nf;
 
-	status = nfs4_preprocess_stateid_op(SVC_NET(rqstp), cstate,
+	status = nfs4_preprocess_stateid_op(rqstp, cstate,
 					    &seek->seek_stateid,
-					    RD_STATE, &file);
+					    RD_STATE, &nf);
 	if (status) {
 		dprintk("NFSD: nfsd4_seek: couldn't process stateid!\n");
 		return status;
 	}
-	if (!file)
-		return nfserr_bad_stateid;
 
 	switch (seek->seek_whence) {
 	case NFS4_CONTENT_DATA:
@@ -1091,14 +1082,14 @@ nfsd4_seek(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	 * Note:  This call does change file->f_pos, but nothing in NFSD
 	 *        should ever file->f_pos.
 	 */
-	seek->seek_pos = vfs_llseek(file, seek->seek_offset, whence);
+	seek->seek_pos = vfs_llseek(nf->nf_file, seek->seek_offset, whence);
 	if (seek->seek_pos < 0)
 		status = nfserrno(seek->seek_pos);
-	else if (seek->seek_pos >= i_size_read(file_inode(file)))
+	else if (seek->seek_pos >= i_size_read(file_inode(nf->nf_file)))
 		seek->seek_eof = true;
 
 out:
-	fput(file);
+	nfsd_file_put(nf);
 	return status;
 }
 
@@ -1321,6 +1312,7 @@ nfsd4_layoutget(struct svc_rqst *rqstp,
 	nfserr = nfsd4_insert_layout(lgp, ls);
 
 out_put_stid:
+	mutex_unlock(&ls->ls_mutex);
 	nfs4_put_stid(&ls->ls_stid);
 out:
 	return nfserr;
@@ -1374,9 +1366,8 @@ nfsd4_layoutcommit(struct svc_rqst *rqstp,
 		goto out;
 	}
 
-	nfserr = ops->proc_layoutcommit(inode, lcp);
-	if (nfserr)
-		goto out_put_stid;
+	/* LAYOUTCOMMIT does not require any serialization */
+	mutex_unlock(&ls->ls_mutex);
 
 	if (new_size > i_size_read(inode)) {
 		lcp->lc_size_chg = 1;
@@ -1385,7 +1376,7 @@ nfsd4_layoutcommit(struct svc_rqst *rqstp,
 		lcp->lc_size_chg = 0;
 	}
 
-out_put_stid:
+	nfserr = ops->proc_layoutcommit(inode, lcp);
 	nfs4_put_stid(&ls->ls_stid);
 out:
 	return nfserr;
@@ -1733,10 +1724,6 @@ encode_op:
 			be32_to_cpu(status));
 
 		nfsd4_cstate_clear_replay(cstate);
-		/* XXX Ugh, we need to get rid of this kind of special case: */
-		if (op->opnum == OP_READ && op->u.read.rd_filp)
-			fput(op->u.read.rd_filp);
-
 		nfsd4_increment_op_stats(op->opnum);
 	}
 
@@ -1802,7 +1789,8 @@ static inline u32 nfsd4_getattr_rsize(struct svc_rqst *rqstp,
 	u32 bmap0 = bmap[0], bmap1 = bmap[1], bmap2 = bmap[2];
 	u32 ret = 0;
 
-	if (bmap0 & FATTR4_WORD0_ACL)
+	if (bmap0 & FATTR4_WORD0_ACL ||
+	    bmap1 & FATTR4_WORD1_DACL)
 		return svc_max_payload(rqstp);
 	if (bmap0 & FATTR4_WORD0_FS_LOCATIONS)
 		return svc_max_payload(rqstp);

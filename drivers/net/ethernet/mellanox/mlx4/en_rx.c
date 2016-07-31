@@ -666,7 +666,7 @@ static void mlx4_en_refill_rx_buffers(struct mlx4_en_priv *priv,
 
 	while ((u32) (ring->prod - ring->cons) < ring->actual_size) {
 		if (mlx4_en_prepare_rx_desc(priv, ring, index,
-					    GFP_ATOMIC | __GFP_COLD))
+				GFP_ATOMIC | __GFP_COLD | __GFP_NOWARN))
 			break;
 		ring->prod++;
 		index = ring->prod & ring->size_mask;

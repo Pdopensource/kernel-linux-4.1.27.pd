@@ -184,7 +184,7 @@ __be32 nlmclnt_grant(const struct sockaddr *addr, const struct nlm_lock *lock)
 		 */
 		if (fl_blocked->fl_u.nfs_fl.owner->pid != lock->svid)
 			continue;
-		if (!rpc_cmp_addr(nlm_addr(block->b_host), addr))
+		if (!rpc_cmp_addr(nlm_addr(block->b_host), addr, false))
 			continue;
 		if (nfs_compare_fh(NFS_FH(file_inode(fl_blocked->fl_file)) ,fh) != 0)
 			continue;

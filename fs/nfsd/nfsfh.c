@@ -267,6 +267,16 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
 
 	fhp->fh_dentry = dentry;
 	fhp->fh_export = exp;
+
+	switch (rqstp->rq_vers) {
+	case 3:
+		if (!(dentry->d_sb->s_export_op->flags & EXPORT_OP_NOWCC))
+			break;
+		/* Fallthrough */
+	case 2:
+		fhp->fh_no_wcc = true;
+	}
+
 	return 0;
 out:
 	exp_put(exp);
@@ -319,10 +329,10 @@ fh_verify(struct svc_rqst *rqstp, struct svc_fh *fhp, umode_t type, int access)
 	/*
 	 * We still have to do all these permission checks, even when
 	 * fh_dentry is already set:
-	 * 	- fh_verify may be called multiple times with different
-	 * 	  "access" arguments (e.g. nfsd_proc_create calls
-	 * 	  fh_verify(...,NFSD_MAY_EXEC) first, then later (in
-	 * 	  nfsd_create) calls fh_verify(...,NFSD_MAY_CREATE).
+	 *	- fh_verify may be called multiple times with different
+	 *	  "access" arguments (e.g. nfsd_proc_create calls
+	 *	  fh_verify(...,NFSD_MAY_EXEC) first, then later (in
+	 *	  nfsd_create) calls fh_verify(...,NFSD_MAY_CREATE_FILE).
 	 *	- in the NFSv4 case, the filehandle may have been filled
 	 *	  in by fh_compose, and given a dentry, but further
 	 *	  compound operations performed with that filehandle
@@ -535,6 +545,9 @@ fh_compose(struct svc_fh *fhp, struct svc_export *exp, struct dentry *dentry,
 	 */
 	 set_version_and_fsid_type(fhp, exp, ref_fh);
 
+	/* If we have a ref_fh, then copy the fh_no_wcc setting from it. */
+	fhp->fh_no_wcc = ref_fh ? ref_fh->fh_no_wcc : false;
+
 	if (ref_fh == fhp)
 		fh_put(ref_fh);
 
@@ -631,16 +644,14 @@ fh_put(struct svc_fh *fhp)
 		fh_unlock(fhp);
 		fhp->fh_dentry = NULL;
 		dput(dentry);
-#ifdef CONFIG_NFSD_V3
-		fhp->fh_pre_saved = 0;
-		fhp->fh_post_saved = 0;
-#endif
+		fh_clear_wcc(fhp);
 	}
 	fh_drop_write(fhp);
 	if (exp) {
 		exp_put(exp);
 		fhp->fh_export = NULL;
 	}
+	fhp->fh_no_wcc = false;
 	return;
 }
 

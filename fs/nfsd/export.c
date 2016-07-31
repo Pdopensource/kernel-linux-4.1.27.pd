@@ -21,6 +21,7 @@
 #include "nfsfh.h"
 #include "netns.h"
 #include "pnfs.h"
+#include "filecache.h"
 
 #define NFSDDBG_FACILITY	NFSDDBG_EXPORT
 
@@ -231,6 +232,18 @@ static struct cache_head *expkey_alloc(void)
 		return NULL;
 }
 
+static void
+expkey_flush(void)
+{
+	/*
+	 * Take the nfsd_mutex here to ensure that the file cache is not
+	 * destroyed while we're in the middle of flushing.
+	 */
+	mutex_lock(&nfsd_mutex);
+	nfsd_file_cache_purge();
+	mutex_unlock(&nfsd_mutex);
+}
+
 static struct cache_detail svc_expkey_cache_template = {
 	.owner		= THIS_MODULE,
 	.hash_size	= EXPKEY_HASHMAX,
@@ -243,6 +256,7 @@ static struct cache_detail svc_expkey_cache_template = {
 	.init		= expkey_init,
 	.update       	= expkey_update,
 	.alloc		= expkey_alloc,
+	.flush		= expkey_flush,
 };
 
 static int
@@ -378,6 +392,18 @@ static int check_export(struct inode *inode, int *flags, unsigned char *uuid)
 		return -EINVAL;
 	}
 
+#if 0
+	/*
+	 * FIXME: this check is currently broken until exportfs passes in the
+	 * right options when vetting exports. For now, we comment it out...
+	 */
+	if (inode->i_sb->s_export_op->flags & EXPORT_OP_NOSUBTREECHK &&
+	    !(*flags & NFSEXP_NOSUBTREECHECK)) {
+		dprintk("%s: %s does not support subtree checking!\n",
+			__func__, inode->i_sb->s_type->name);
+		return -EINVAL;
+	}
+#endif
 	return 0;
 
 }

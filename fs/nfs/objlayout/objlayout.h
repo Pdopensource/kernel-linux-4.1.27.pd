@@ -163,9 +163,11 @@ extern struct pnfs_layout_segment *objlayout_alloc_lseg(
 extern void objlayout_free_lseg(struct pnfs_layout_segment *);
 
 extern enum pnfs_try_status objlayout_read_pagelist(
+	struct nfs_pageio_descriptor *,
 	struct nfs_pgio_header *);
 
 extern enum pnfs_try_status objlayout_write_pagelist(
+	struct nfs_pageio_descriptor *,
 	struct nfs_pgio_header *,
 	int how);
 

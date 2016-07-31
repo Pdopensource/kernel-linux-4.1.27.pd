@@ -2210,6 +2210,26 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
 			of returning the full 64-bit number.
 			The default is to return 64-bit inode numbers.
 
+	nfs.localio_datasync=
+			[NFS] localio uses datasync
+			If true, the NFS client will translate COMMIT into a
+			fdatasync() operation when bypassing the server and
+			doing I/O directly to the underlying filesystem.
+			This may enhance performance, but in the case of
+			a kernel crash, it could cause the loss of c/mtime
+			and NFSv4 change attribute updates that are due to
+			WRITEs. Data integrity is guaranteed, however.
+			The default setting is off.
+
+	nfs.localio_enabled=
+			[NFS] enable localio
+			If true, the NFS client will check if the NFS server
+			is actually a knfsd server running locally and,
+			if so, it will send READ and WRITE requests through
+			the VFS read() and write() calls directly to the
+			underlying filesystem.
+			The default setting is on.
+
 	nfs.max_session_slots=
 			[NFSv4.1] Sets the maximum number of session slots
 			the client will attempt to negotiate with the server.
@@ -2256,12 +2276,36 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
 			The default parameter value of '0' causes the kernel
 			not to attempt recovery of lost locks.
 
+	nfs4.layoutstats_timer =
+			[NFSv4.2] Change the rate at which the kernel sends
+			layoutstats to the pNFS metadata server.
+
+			Setting this to value to 0 causes the kernel to use
+			whatever value is the default set by the layout
+			driver. A non-zero value sets the minimum interval
+			in seconds between layoutstats transmissions.
+
+	nfsd.commit_is_datasync=
+			[NFS] commit uses datasync
+			If true, the NFS server will translate COMMIT into a
+			fdatasync() operation.
+			This may enhance performance, but in the case of
+			a kernel crash, it could cause the loss of c/mtime
+			and NFSv4 change attribute updates that are due to
+			WRITEs. Data integrity is guaranteed, however.
+			The default setting is off.
+
 	nfsd.nfs4_disable_idmapping=
 			[NFSv4] When set to the default of '1', the NFSv4
 			server will return only numeric uids and gids to
 			clients using auth_sys, and will accept numeric uids
 			and gids from such clients.  This is intended to ease
 			migration from NFSv2/v3.
+
+	nfsd.may_use_splice=
+			[NFS] When set to 'Y' this allows knfsd to use the
+			splice() syscall to do zero copy reads from the
+			file. The default is 'N'.
 
 	objlayoutdriver.osd_login_prog=
 			[NFS] [OBJLAYOUT] sets the pathname to the program which
@@ -3484,6 +3528,12 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
 			kernel's sunrpc client considers to be privileged
 			using these two parameters to set the minimum and
 			maximum port values.
+
+	sunrpc.svc_rpc_per_connection_limit=
+			[NFS,SUNRPC]
+			Limit the number of requests that the server will
+			process in parallel from a single connection.
+			The default value is 0 (no limit).
 
 	sunrpc.pool_mode=
 			[NFS]

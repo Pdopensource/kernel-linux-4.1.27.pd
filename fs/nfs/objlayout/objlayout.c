@@ -266,7 +266,8 @@ objlayout_read_done(struct objlayout_io_res *oir, ssize_t status, bool sync)
  * Perform sync or async reads.
  */
 enum pnfs_try_status
-objlayout_read_pagelist(struct nfs_pgio_header *hdr)
+objlayout_read_pagelist(struct nfs_pageio_descriptor *desc,
+			struct nfs_pgio_header *hdr)
 {
 	struct inode *inode = hdr->inode;
 	loff_t offset = hdr->args.offset;
@@ -350,7 +351,8 @@ objlayout_write_done(struct objlayout_io_res *oir, ssize_t status, bool sync)
  * Perform sync or async writes.
  */
 enum pnfs_try_status
-objlayout_write_pagelist(struct nfs_pgio_header *hdr, int how)
+objlayout_write_pagelist(struct nfs_pageio_descriptor *desc,
+			 struct nfs_pgio_header *hdr, int how)
 {
 	int err;
 

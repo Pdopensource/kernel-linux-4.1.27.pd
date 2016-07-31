@@ -90,6 +90,8 @@ struct nfs_open_context {
 
 	struct list_head list;
 	struct nfs4_threshold	*mdsthreshold;
+
+	struct file *local_filp;
 };
 
 struct nfs_open_dir_context {
@@ -128,6 +130,17 @@ struct nfs_inode {
 	unsigned long		flags;			/* atomic bit ops */
 	unsigned long		cache_validity;		/* bit mask */
 
+	struct rw_semaphore	io_lock;
+
+	/*
+	 * NFS Attributes not included in struct inode
+	 */
+
+	struct timespec		timecreate;
+	struct timespec		timebackup;
+	bool			hidden;
+	bool			system;
+	bool			archive;
 	/*
 	 * read_cache_jiffies is when we started read-caching this inode.
 	 * attrtimeo is for how long the cached information is assumed
@@ -176,7 +189,6 @@ struct nfs_inode {
 	wait_queue_head_t	waitqueue;
 
 #if IS_ENABLED(CONFIG_NFS_V4)
-	struct nfs4_cached_acl	*nfs4_acl;
         /* NFSv4 state */
 	struct list_head	open_states;
 	struct nfs_delegation __rcu *delegation;
@@ -213,12 +225,12 @@ struct nfs_inode {
 #define NFS_INO_STALE		(1)		/* possible stale inode */
 #define NFS_INO_ACL_LRU_SET	(2)		/* Inode is on the LRU list */
 #define NFS_INO_INVALIDATING	(3)		/* inode is being invalidated */
-#define NFS_INO_FLUSHING	(4)		/* inode is flushing out data */
 #define NFS_INO_FSCACHE		(5)		/* inode can be cached by FS-Cache */
 #define NFS_INO_FSCACHE_LOCK	(6)		/* FS-Cache cookie management lock */
-#define NFS_INO_COMMIT		(7)		/* inode is committing unstable writes */
 #define NFS_INO_LAYOUTCOMMIT	(9)		/* layoutcommit required */
 #define NFS_INO_LAYOUTCOMMITTING (10)		/* layoutcommit inflight */
+#define NFS_INO_LAYOUTSTATS	(11)		/* layoutstats inflight */
+#define NFS_INO_ODIRECT		(12)		/* I/O setting is O_DIRECT */
 
 static inline struct nfs_inode *NFS_I(const struct inode *inode)
 {
@@ -340,6 +352,7 @@ extern void nfs_zap_caches(struct inode *);
 extern void nfs_invalidate_atime(struct inode *);
 extern struct inode *nfs_fhget(struct super_block *, struct nfs_fh *,
 				struct nfs_fattr *, struct nfs4_label *);
+struct inode *nfs_ilookup(struct super_block *sb, struct nfs_fattr *, struct nfs_fh *);
 extern int nfs_refresh_inode(struct inode *, struct nfs_fattr *);
 extern int nfs_post_op_update_inode(struct inode *inode, struct nfs_fattr *fattr);
 extern int nfs_post_op_update_inode_force_wcc(struct inode *inode, struct nfs_fattr *fattr);
@@ -513,11 +526,23 @@ extern int  nfs_updatepage(struct file *, struct page *, unsigned int, unsigned 
  */
 extern int nfs_sync_inode(struct inode *inode);
 extern int nfs_wb_all(struct inode *inode);
-extern int nfs_wb_page(struct inode *inode, struct page* page);
+extern int nfs_wb_single_page(struct inode *inode, struct page *page, bool launder);
 extern int nfs_wb_page_cancel(struct inode *inode, struct page* page);
 extern int  nfs_commit_inode(struct inode *, int);
 extern struct nfs_commit_data *nfs_commitdata_alloc(void);
 extern void nfs_commit_free(struct nfs_commit_data *data);
+
+static inline int
+nfs_wb_launder_page(struct inode *inode, struct page *page)
+{
+	return nfs_wb_single_page(inode, page, true);
+}
+
+static inline int
+nfs_wb_page(struct inode *inode, struct page *page)
+{
+	return nfs_wb_single_page(inode, page, false);
+}
 
 static inline int
 nfs_have_writebacks(struct inode *inode)

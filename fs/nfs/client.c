@@ -176,6 +176,7 @@ struct nfs_client *nfs_alloc_client(const struct nfs_client_initdata *cl_init)
 	}
 
 	INIT_LIST_HEAD(&clp->cl_superblocks);
+	INIT_LIST_HEAD(&clp->cl_local_addrs);
 	clp->cl_rpcclient = ERR_PTR(-EINVAL);
 
 	clp->cl_proto = cl_init->proto;
@@ -185,6 +186,7 @@ struct nfs_client *nfs_alloc_client(const struct nfs_client_initdata *cl_init)
 	if (!IS_ERR(cred))
 		clp->cl_machine_cred = cred;
 	nfs_fscache_get_client_cookie(clp);
+	nfs_probe_local_addr(clp);
 
 	return clp;
 
@@ -239,7 +241,11 @@ static void pnfs_init_server(struct nfs_server *server)
  */
 void nfs_free_client(struct nfs_client *clp)
 {
+	struct nfs_local_addr *addr, *tmp;
+
 	dprintk("--> nfs_free_client(%u)\n", clp->rpc_ops->version);
+
+	nfs_local_disable(clp);
 
 	nfs_fscache_release_client_cookie(clp);
 
@@ -249,6 +255,11 @@ void nfs_free_client(struct nfs_client *clp)
 
 	if (clp->cl_machine_cred != NULL)
 		put_rpccred(clp->cl_machine_cred);
+
+	list_for_each_entry_safe(addr, tmp, &clp->cl_local_addrs, cl_addrs) {
+		list_del(&addr->cl_addrs);
+		kfree(addr);
+	}
 
 	put_net(clp->cl_net);
 	put_nfs_version(clp->cl_nfs_mod);
@@ -508,6 +519,7 @@ nfs_get_client(const struct nfs_client_initdata *cl_init,
 					&nn->nfs_client_list);
 			spin_unlock(&nn->nfs_client_lock);
 			new->cl_flags = cl_init->init_flags;
+			nfs_local_probe(new);
 			return rpc_ops->init_client(new, timeparms, ip_addr);
 		}
 
@@ -825,7 +837,6 @@ error:
  * Load up the server record from information gained in an fsinfo record
  */
 static void nfs_server_set_fsinfo(struct nfs_server *server,
-				  struct nfs_fh *mntfh,
 				  struct nfs_fsinfo *fsinfo)
 {
 	unsigned long max_rpc_payload;
@@ -874,6 +885,7 @@ static void nfs_server_set_fsinfo(struct nfs_server *server,
 
 	server->time_delta = fsinfo->time_delta;
 
+	server->clone_blksize = fsinfo->clone_blksize;
 	/* We're airborne Set socket buffersize */
 	rpc_setbufsize(server->client, server->wsize + 100, server->rsize + 100);
 }
@@ -901,7 +913,7 @@ int nfs_probe_fsinfo(struct nfs_server *server, struct nfs_fh *mntfh, struct nfs
 	if (error < 0)
 		goto out_error;
 
-	nfs_server_set_fsinfo(server, mntfh, &fsinfo);
+	nfs_server_set_fsinfo(server, &fsinfo);
 
 	/* Get some general file system info */
 	if (server->namelen == 0) {
@@ -1193,8 +1205,6 @@ void nfs_clients_init(struct net *net)
 }
 
 #ifdef CONFIG_PROC_FS
-static struct proc_dir_entry *proc_fs_nfs;
-
 static int nfs_server_list_open(struct inode *inode, struct file *file);
 static void *nfs_server_list_start(struct seq_file *p, loff_t *pos);
 static void *nfs_server_list_next(struct seq_file *p, void *v, loff_t *pos);
@@ -1288,6 +1298,7 @@ static int nfs_server_list_show(struct seq_file *m, void *v)
 {
 	struct nfs_client *clp;
 	struct nfs_net *nn = net_generic(seq_file_net(m), nfs_net_id);
+	char more[10];
 
 	/* display header on line 1 */
 	if (v == &nn->nfs_client_list) {
@@ -1302,13 +1313,16 @@ static int nfs_server_list_show(struct seq_file *m, void *v)
 	if (clp->cl_cons_state != NFS_CS_READY)
 		return 0;
 
+	snprintf(more, sizeof(more), " %s",
+		nfs_server_is_local(clp) ? "local_io " : "");
+
 	rcu_read_lock();
-	seq_printf(m, "v%u %s %s %3d %s\n",
+	seq_printf(m, "v%u %s %s %3d %-20s %s\n",
 		   clp->rpc_ops->version,
 		   rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_HEX_ADDR),
 		   rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_HEX_PORT),
 		   atomic_read(&clp->cl_count),
-		   clp->cl_hostname);
+		   clp->cl_hostname, more);
 	rcu_read_unlock();
 
 	return 0;
@@ -1364,27 +1378,29 @@ static int nfs_volume_list_show(struct seq_file *m, void *v)
 {
 	struct nfs_server *server;
 	struct nfs_client *clp;
-	char dev[8], fsid[17];
+	char dev[13];	// 8 for 2^24, 1 for ':', 3 for 2^8, 1 for '\0'
+	char fsid[34];	// 2 * 16 for %llx, 1 for ':', 1 for '\0'
 	struct nfs_net *nn = net_generic(seq_file_net(m), nfs_net_id);
 
 	/* display header on line 1 */
 	if (v == &nn->nfs_volume_list) {
-		seq_puts(m, "NV SERVER   PORT DEV     FSID              FSC\n");
+		seq_puts(m, "NV SERVER   PORT DEV          FSID"
+			    "                              FSC\n");
 		return 0;
 	}
 	/* display one transport per line on subsequent lines */
 	server = list_entry(v, struct nfs_server, master_link);
 	clp = server->nfs_client;
 
-	snprintf(dev, 8, "%u:%u",
+	snprintf(dev, sizeof(dev), "%u:%u",
 		 MAJOR(server->s_dev), MINOR(server->s_dev));
 
-	snprintf(fsid, 17, "%llx:%llx",
+	snprintf(fsid, sizeof(fsid), "%llx:%llx",
 		 (unsigned long long) server->fsid.major,
 		 (unsigned long long) server->fsid.minor);
 
 	rcu_read_lock();
-	seq_printf(m, "v%u %s %s %-7s %-17s %s\n",
+	seq_printf(m, "v%u %s %s %-12s %-33s %s\n",
 		   clp->rpc_ops->version,
 		   rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_HEX_ADDR),
 		   rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_HEX_PORT),
@@ -1434,27 +1450,20 @@ void nfs_fs_proc_net_exit(struct net *net)
  */
 int __init nfs_fs_proc_init(void)
 {
-	struct proc_dir_entry *p;
-
-	proc_fs_nfs = proc_mkdir("fs/nfsfs", NULL);
-	if (!proc_fs_nfs)
+	if (!proc_mkdir("fs/nfsfs", NULL))
 		goto error_0;
 
 	/* a file of servers with which we're dealing */
-	p = proc_symlink("servers", proc_fs_nfs, "../../net/nfsfs/servers");
-	if (!p)
+	if (!proc_symlink("fs/nfsfs/servers", NULL, "../../net/nfsfs/servers"))
 		goto error_1;
 
 	/* a file of volumes that we have mounted */
-	p = proc_symlink("volumes", proc_fs_nfs, "../../net/nfsfs/volumes");
-	if (!p)
-		goto error_2;
-	return 0;
+	if (!proc_symlink("fs/nfsfs/volumes", NULL, "../../net/nfsfs/volumes"))
+		goto error_1;
 
-error_2:
-	remove_proc_entry("servers", proc_fs_nfs);
+	return 0;
 error_1:
-	remove_proc_entry("fs/nfsfs", NULL);
+	remove_proc_subtree("fs/nfsfs", NULL);
 error_0:
 	return -ENOMEM;
 }
@@ -1464,9 +1473,7 @@ error_0:
  */
 void nfs_fs_proc_exit(void)
 {
-	remove_proc_entry("volumes", proc_fs_nfs);
-	remove_proc_entry("servers", proc_fs_nfs);
-	remove_proc_entry("fs/nfsfs", NULL);
+	remove_proc_subtree("fs/nfsfs", NULL);
 }
 
 #endif /* CONFIG_PROC_FS */

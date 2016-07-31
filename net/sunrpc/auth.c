@@ -367,6 +367,16 @@ rpcauth_cred_key_to_expire(struct rpc_cred *cred)
 }
 EXPORT_SYMBOL_GPL(rpcauth_cred_key_to_expire);
 
+bool
+rpcauth_map_to_svc_cred(struct rpc_auth *auth, struct rpc_cred *cred,
+			struct svc_cred *scred)
+{
+	if (!cred->cr_ops->crmap_to_svc_cred)
+		return false;
+	return cred->cr_ops->crmap_to_svc_cred(auth, cred, scred);
+}
+EXPORT_SYMBOL_GPL(rpcauth_map_to_svc_cred);
+
 char *
 rpcauth_stringify_acceptor(struct rpc_cred *cred)
 {
@@ -543,7 +553,7 @@ rpcauth_cache_enforce_limit(void)
  */
 struct rpc_cred *
 rpcauth_lookup_credcache(struct rpc_auth *auth, struct auth_cred * acred,
-		int flags)
+		int flags, gfp_t gfp)
 {
 	LIST_HEAD(free);
 	struct rpc_cred_cache *cache = auth->au_credcache;
@@ -580,7 +590,7 @@ rpcauth_lookup_credcache(struct rpc_auth *auth, struct auth_cred * acred,
 	if (flags & RPCAUTH_LOOKUP_RCU)
 		return ERR_PTR(-ECHILD);
 
-	new = auth->au_ops->crcreate(auth, acred, flags);
+	new = auth->au_ops->crcreate(auth, acred, flags, gfp);
 	if (IS_ERR(new)) {
 		cred = new;
 		goto out;

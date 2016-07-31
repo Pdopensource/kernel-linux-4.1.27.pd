@@ -166,6 +166,7 @@ int lease_break_time = 45;
 DEFINE_STATIC_LGLOCK(file_lock_lglock);
 static DEFINE_PER_CPU(struct hlist_head, file_lock_list);
 
+
 /*
  * The blocked_hash is used to find POSIX lock loops for deadlock detection.
  * It is protected by blocked_lock_lock.
@@ -862,7 +863,7 @@ static int posix_locks_deadlock(struct file_lock *caller_fl,
  * whether or not a lock was successfully freed by testing the return
  * value for -ENOENT.
  */
-static int flock_lock_inode(struct inode *inode, struct file_lock *request)
+int flock_lock_inode(struct inode *inode, struct file_lock *request)
 {
 	struct file_lock *new_fl = NULL;
 	struct file_lock *fl;
@@ -929,8 +930,10 @@ out:
 	locks_dispose_list(&dispose);
 	return error;
 }
+EXPORT_SYMBOL(flock_lock_inode);
 
-static int __posix_lock_file(struct inode *inode, struct file_lock *request, struct file_lock *conflock)
+int
+posix_lock_inode(struct inode *inode, struct file_lock *request, struct file_lock *conflock)
 {
 	struct file_lock *fl, *tmp;
 	struct file_lock *new_fl = NULL;
@@ -1140,6 +1143,7 @@ static int __posix_lock_file(struct inode *inode, struct file_lock *request, str
 	locks_dispose_list(&dispose);
 	return error;
 }
+EXPORT_SYMBOL(posix_lock_inode);
 
 /**
  * posix_lock_file - Apply a POSIX-style lock to a file
@@ -1158,7 +1162,7 @@ static int __posix_lock_file(struct inode *inode, struct file_lock *request, str
 int posix_lock_file(struct file *filp, struct file_lock *fl,
 			struct file_lock *conflock)
 {
-	return __posix_lock_file(file_inode(filp), fl, conflock);
+	return posix_lock_inode(file_inode(filp), fl, conflock);
 }
 EXPORT_SYMBOL(posix_lock_file);
 
@@ -1175,7 +1179,7 @@ int posix_lock_inode_wait(struct inode *inode, struct file_lock *fl)
 	int error;
 	might_sleep ();
 	for (;;) {
-		error = __posix_lock_file(inode, fl, NULL);
+		error = posix_lock_inode(inode, fl, NULL);
 		if (error != FILE_LOCK_DEFERRED)
 			break;
 		error = wait_event_interruptible(fl->fl_wait, !fl->fl_next);
@@ -1258,7 +1262,7 @@ int locks_mandatory_area(int read_write, struct inode *inode,
 		if (filp) {
 			fl.fl_owner = filp;
 			fl.fl_flags &= ~FL_SLEEP;
-			error = __posix_lock_file(inode, &fl, NULL);
+			error = posix_lock_inode(inode, &fl, NULL);
 			if (!error)
 				break;
 		}
@@ -1266,7 +1270,7 @@ int locks_mandatory_area(int read_write, struct inode *inode,
 		if (sleep)
 			fl.fl_flags |= FL_SLEEP;
 		fl.fl_owner = current->files;
-		error = __posix_lock_file(inode, &fl, NULL);
+		error = posix_lock_inode(inode, &fl, NULL);
 		if (error != FILE_LOCK_DEFERRED)
 			break;
 		error = wait_event_interruptible(fl.fl_wait, !fl.fl_next);
@@ -1779,6 +1783,40 @@ int generic_setlease(struct file *filp, long arg, struct file_lock **flp,
 }
 EXPORT_SYMBOL(generic_setlease);
 
+#if IS_ENABLED(CONFIG_SRCU)
+/*
+ * Kernel subsystems can register to be notified on any attempt to set
+ * a new lease with the lease_notifier_chain. This is used by (e.g.) nfsd
+ * to close files that it may have cached when there is an attempt to set a
+ * conflicting lease.
+ */
+struct srcu_notifier_head lease_notifier_chain;
+EXPORT_SYMBOL_GPL(lease_notifier_chain);
+
+static inline void
+lease_notifier_chain_init(void)
+{
+	srcu_init_notifier_head(&lease_notifier_chain);
+}
+
+static inline void
+setlease_notifier(long arg, struct file_lock *lease)
+{
+	if (arg != F_UNLCK)
+		srcu_notifier_call_chain(&lease_notifier_chain, arg, lease);
+}
+#else /* !IS_ENABLED(CONFIG_SRCU) */
+static inline void
+lease_notifier_chain_init(void)
+{
+}
+
+static inline void
+setlease_notifier(long arg, struct file_lock *lease)
+{
+}
+#endif /* IS_ENABLED(CONFIG_SRCU) */
+
 /**
  * vfs_setlease        -       sets a lease on an open file
  * @filp:	file pointer
@@ -1799,6 +1837,8 @@ EXPORT_SYMBOL(generic_setlease);
 int
 vfs_setlease(struct file *filp, long arg, struct file_lock **lease, void **priv)
 {
+	if (lease)
+		setlease_notifier(arg, *lease);
 	if (filp->f_op->setlease)
 		return filp->f_op->setlease(filp, arg, lease, priv);
 	else
@@ -2704,6 +2744,7 @@ static int __init filelock_init(void)
 	for_each_possible_cpu(i)
 		INIT_HLIST_HEAD(per_cpu_ptr(&file_lock_list, i));
 
+	lease_notifier_chain_init();
 	return 0;
 }
 

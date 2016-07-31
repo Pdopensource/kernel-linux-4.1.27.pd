@@ -198,12 +198,14 @@ encode_saved_post_attr(struct svc_rqst *rqstp, __be32 *p, struct svc_fh *fhp)
  * Encode post-operation attributes.
  * The inode may be NULL if the call failed because of a stale file
  * handle. In this case, no attributes are returned.
+ * Ditto if the 'getattr' flag is unset.
  */
 static __be32 *
-encode_post_op_attr(struct svc_rqst *rqstp, __be32 *p, struct svc_fh *fhp)
+__encode_post_op_attr(struct svc_rqst *rqstp, __be32 *p, struct svc_fh *fhp,
+		bool getattr)
 {
 	struct dentry *dentry = fhp->fh_dentry;
-	if (dentry && d_really_is_positive(dentry)) {
+	if (getattr && dentry && d_really_is_positive(dentry)) {
 	        __be32 err;
 		struct kstat stat;
 
@@ -216,6 +218,18 @@ encode_post_op_attr(struct svc_rqst *rqstp, __be32 *p, struct svc_fh *fhp)
 	}
 	*p++ = xdr_zero;
 	return p;
+}
+
+static __be32 *
+encode_post_op_attr(struct svc_rqst *rqstp, __be32 *p, struct svc_fh *fhp)
+{
+	return __encode_post_op_attr(rqstp, p, fhp, true);
+}
+
+static __be32 *
+encode_post_op_attr_opportunistic(struct svc_rqst *rqstp, __be32 *p, struct svc_fh *fhp)
+{
+	return __encode_post_op_attr(rqstp, p, fhp, !fhp->fh_no_wcc);
 }
 
 /* Helper for NFSv3 ACLs */
@@ -246,7 +260,7 @@ encode_wcc_data(struct svc_rqst *rqstp, __be32 *p, struct svc_fh *fhp)
 	}
 	/* no pre- or post-attrs */
 	*p++ = xdr_zero;
-	return encode_post_op_attr(rqstp, p, fhp);
+	return encode_post_op_attr_opportunistic(rqstp, p, fhp);
 }
 
 /*
@@ -256,17 +270,20 @@ void fill_post_wcc(struct svc_fh *fhp)
 {
 	__be32 err;
 
+	if (fhp->fh_no_wcc)
+		return;
+
 	if (fhp->fh_post_saved)
 		printk("nfsd: inode locked twice during operation.\n");
 
 	err = fh_getattr(fhp, &fhp->fh_post_attr);
 	fhp->fh_post_change = d_inode(fhp->fh_dentry)->i_version;
 	if (err) {
-		fhp->fh_post_saved = 0;
+		fhp->fh_post_saved = false;
 		/* Grab the ctime anyway - set_change_info might use it */
 		fhp->fh_post_attr.ctime = d_inode(fhp->fh_dentry)->i_ctime;
 	} else
-		fhp->fh_post_saved = 1;
+		fhp->fh_post_saved = true;
 }
 
 /*
@@ -653,7 +670,7 @@ nfs3svc_encode_diropres(struct svc_rqst *rqstp, __be32 *p,
 		p = encode_fh(p, &resp->fh);
 		p = encode_post_op_attr(rqstp, p, &resp->fh);
 	}
-	p = encode_post_op_attr(rqstp, p, &resp->dirfh);
+	p = encode_post_op_attr_opportunistic(rqstp, p, &resp->dirfh);
 	return xdr_ressize_check(rqstp, p);
 }
 
@@ -662,7 +679,7 @@ int
 nfs3svc_encode_accessres(struct svc_rqst *rqstp, __be32 *p,
 					struct nfsd3_accessres *resp)
 {
-	p = encode_post_op_attr(rqstp, p, &resp->fh);
+	p = encode_post_op_attr_opportunistic(rqstp, p, &resp->fh);
 	if (resp->status == 0)
 		*p++ = htonl(resp->access);
 	return xdr_ressize_check(rqstp, p);
@@ -673,7 +690,7 @@ int
 nfs3svc_encode_readlinkres(struct svc_rqst *rqstp, __be32 *p,
 					struct nfsd3_readlinkres *resp)
 {
-	p = encode_post_op_attr(rqstp, p, &resp->fh);
+	p = encode_post_op_attr_opportunistic(rqstp, p, &resp->fh);
 	if (resp->status == 0) {
 		*p++ = htonl(resp->len);
 		xdr_ressize_check(rqstp, p);
@@ -694,7 +711,7 @@ int
 nfs3svc_encode_readres(struct svc_rqst *rqstp, __be32 *p,
 					struct nfsd3_readres *resp)
 {
-	p = encode_post_op_attr(rqstp, p, &resp->fh);
+	p = encode_post_op_attr_opportunistic(rqstp, p, &resp->fh);
 	if (resp->status == 0) {
 		*p++ = htonl(resp->count);
 		*p++ = htonl(resp->eof);
@@ -769,7 +786,7 @@ int
 nfs3svc_encode_readdirres(struct svc_rqst *rqstp, __be32 *p,
 					struct nfsd3_readdirres *resp)
 {
-	p = encode_post_op_attr(rqstp, p, &resp->fh);
+	p = encode_post_op_attr_opportunistic(rqstp, p, &resp->fh);
 
 	if (resp->status == 0) {
 		/* stupid readdir cookie */
@@ -830,6 +847,8 @@ compose_entry_fh(struct nfsd3_readdirres *cd, struct svc_fh *fhp,
 		goto out;
 	if (d_really_is_negative(dchild))
 		goto out;
+	if (IS_AUTOMOUNT(dchild->d_inode))
+		goto out;
 	rv = fh_compose(fhp, exp, dchild, &cd->fh);
 out:
 	dput(dchild);
@@ -848,7 +867,7 @@ static __be32 *encode_entryplus_baggage(struct nfsd3_readdirres *cd, __be32 *p, 
 		*p++ = 0;
 		goto out;
 	}
-	p = encode_post_op_attr(cd->rqstp, p, fh);
+	p = encode_post_op_attr_opportunistic(cd->rqstp, p, fh);
 	*p++ = xdr_one;			/* yes, a file handle follows */
 	p = encode_fh(p, fh);
 out:

@@ -230,47 +230,6 @@ __xfs_set_acl(struct inode *inode, int type, struct posix_acl *acl)
 	return error;
 }
 
-static int
-xfs_set_mode(struct inode *inode, umode_t mode)
-{
-	int error = 0;
-
-	if (mode != inode->i_mode) {
-		struct iattr iattr;
-
-		iattr.ia_valid = ATTR_MODE | ATTR_CTIME;
-		iattr.ia_mode = mode;
-		iattr.ia_ctime = current_fs_time(inode->i_sb);
-
-		error = xfs_setattr_nonsize(XFS_I(inode), &iattr, XFS_ATTR_NOACL);
-	}
-
-	return error;
-}
-
-static int
-xfs_acl_exists(struct inode *inode, unsigned char *name)
-{
-	int len = XFS_ACL_MAX_SIZE(XFS_M(inode->i_sb));
-
-	return (xfs_attr_get(XFS_I(inode), name, NULL, &len,
-			    ATTR_ROOT|ATTR_KERNOVAL) == 0);
-}
-
-int
-posix_acl_access_exists(struct inode *inode)
-{
-	return xfs_acl_exists(inode, SGI_ACL_FILE);
-}
-
-int
-posix_acl_default_exists(struct inode *inode)
-{
-	if (!S_ISDIR(inode->i_mode))
-		return 0;
-	return xfs_acl_exists(inode, SGI_ACL_DEFAULT);
-}
-
 int
 xfs_set_acl(struct inode *inode, struct posix_acl *acl, int type)
 {

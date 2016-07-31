@@ -47,12 +47,14 @@ static inline void rpc_set_port(struct sockaddr *sap,
 #define IPV6_SCOPE_ID_LEN		sizeof("%nnnnnnnnnn")
 
 static inline bool __rpc_cmp_addr4(const struct sockaddr *sap1,
-				   const struct sockaddr *sap2)
+				   const struct sockaddr *sap2,
+				   bool checkport)
 {
 	const struct sockaddr_in *sin1 = (const struct sockaddr_in *)sap1;
 	const struct sockaddr_in *sin2 = (const struct sockaddr_in *)sap2;
 
-	return sin1->sin_addr.s_addr == sin2->sin_addr.s_addr;
+	return sin1->sin_addr.s_addr == sin2->sin_addr.s_addr &&
+	       (!checkport || sin1->sin_port == sin2->sin_port);
 }
 
 static inline bool __rpc_copy_addr4(struct sockaddr *dst,
@@ -67,18 +69,22 @@ static inline bool __rpc_copy_addr4(struct sockaddr *dst,
 }
 
 #if IS_ENABLED(CONFIG_IPV6)
+extern size_t rpc_ntop6_addr_noscopeid(const struct in6_addr *addr,
+				       char *buf, const int buflen);
+
 static inline bool __rpc_cmp_addr6(const struct sockaddr *sap1,
-				   const struct sockaddr *sap2)
+				   const struct sockaddr *sap2,
+				   bool checkport)
 {
 	const struct sockaddr_in6 *sin1 = (const struct sockaddr_in6 *)sap1;
 	const struct sockaddr_in6 *sin2 = (const struct sockaddr_in6 *)sap2;
 
-	if (!ipv6_addr_equal(&sin1->sin6_addr, &sin2->sin6_addr))
+	if (!ipv6_addr_equal(&sin1->sin6_addr, &sin2->sin6_addr) ||
+	    (ipv6_addr_type(&sin1->sin6_addr) & IPV6_ADDR_LINKLOCAL &&
+	     sin1->sin6_scope_id != sin2->sin6_scope_id))
 		return false;
-	else if (ipv6_addr_type(&sin1->sin6_addr) & IPV6_ADDR_LINKLOCAL)
-		return sin1->sin6_scope_id == sin2->sin6_scope_id;
 
-	return true;
+	return checkport ? sin1->sin6_port == sin2->sin6_port : true;
 }
 
 static inline bool __rpc_copy_addr6(struct sockaddr *dst,
@@ -93,8 +99,15 @@ static inline bool __rpc_copy_addr6(struct sockaddr *dst,
 	return true;
 }
 #else	/* !(IS_ENABLED(CONFIG_IPV6) */
+static size_t rpc_ntop6_addr_noscopeid(const struct in6_addr *addr,
+				       char *buf, const int buflen)
+{
+	return 0;
+}
+
 static inline bool __rpc_cmp_addr6(const struct sockaddr *sap1,
-				   const struct sockaddr *sap2)
+				   const struct sockaddr *sap2,
+				   bool checkport)
 {
 	return false;
 }
@@ -110,21 +123,23 @@ static inline bool __rpc_copy_addr6(struct sockaddr *dst,
  * rpc_cmp_addr - compare the address portion of two sockaddrs.
  * @sap1: first sockaddr
  * @sap2: second sockaddr
+ * @checkport: check address port
  *
- * Just compares the family and address portion. Ignores port, but
+ * Just compares the family, address portion and possibly port, and
  * compares the scope if it's a link-local address.
  *
  * Returns true if the addrs are equal, false if they aren't.
  */
 static inline bool rpc_cmp_addr(const struct sockaddr *sap1,
-				const struct sockaddr *sap2)
+				const struct sockaddr *sap2,
+				bool checkport)
 {
 	if (sap1->sa_family == sap2->sa_family) {
 		switch (sap1->sa_family) {
 		case AF_INET:
-			return __rpc_cmp_addr4(sap1, sap2);
+			return __rpc_cmp_addr4(sap1, sap2, checkport);
 		case AF_INET6:
-			return __rpc_cmp_addr6(sap1, sap2);
+			return __rpc_cmp_addr6(sap1, sap2, checkport);
 		}
 	}
 	return false;

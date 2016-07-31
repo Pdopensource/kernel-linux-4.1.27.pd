@@ -25,7 +25,6 @@ struct svc_xprt_ops {
 	void		(*xpo_detach)(struct svc_xprt *);
 	void		(*xpo_free)(struct svc_xprt *);
 	int		(*xpo_secure_port)(struct svc_rqst *);
-	void		(*xpo_adjust_wspace)(struct svc_xprt *);
 };
 
 struct svc_xprt_class {
@@ -66,9 +65,11 @@ struct svc_xprt {
 #define XPT_LISTENER	10		/* listening endpoint */
 #define XPT_CACHE_AUTH	11		/* cache auth info */
 #define XPT_LOCAL	12		/* connection from loopback interface */
+#define XPT_RESCUE	13		/* rescue thread allocated */
 
 	struct svc_serv		*xpt_server;	/* service for transport */
 	atomic_t    	    	xpt_reserved;	/* space on outq that is rsvd */
+	atomic_t		xpt_inflight;	/* RPCs currently in flight */
 	struct mutex		xpt_mutex;	/* to serialize sending data */
 	spinlock_t		xpt_lock;	/* protects sk_deferred
 						 * and xpt_auth_cache */
@@ -127,6 +128,7 @@ struct	svc_xprt *svc_find_xprt(struct svc_serv *serv, const char *xcl_name,
 			const unsigned short port);
 int	svc_xprt_names(struct svc_serv *serv, char *buf, const int buflen);
 void	svc_add_new_perm_xprt(struct svc_serv *serv, struct svc_xprt *xprt);
+struct cache_deferred_req *svc_defer(struct cache_req *req);
 
 static inline void svc_xprt_get(struct svc_xprt *xprt)
 {

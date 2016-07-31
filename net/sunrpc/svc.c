@@ -20,6 +20,7 @@
 #include <linux/module.h>
 #include <linux/kthread.h>
 #include <linux/slab.h>
+#include <linux/freezer.h>
 
 #include <linux/sunrpc/types.h>
 #include <linux/sunrpc/xdr.h>
@@ -33,6 +34,9 @@
 #define RPCDBG_FACILITY	RPCDBG_SVCDSP
 
 static void svc_unregister(const struct svc_serv *serv, struct net *net);
+static struct svc_rqst *
+__svc_prepare_thread(struct svc_serv *serv, struct svc_pool *pool, int node,
+		bool istmp);
 
 #define svc_serv_is_pooled(serv)    ((serv)->sv_function)
 
@@ -434,7 +438,7 @@ __svc_create(struct svc_program *prog, unsigned int bufsize, int npools,
 		return NULL;
 	serv->sv_name      = prog->pg_name;
 	serv->sv_program   = prog;
-	serv->sv_nrthreads = 1;
+	atomic_set(&serv->sv_refcount, 1);
 	serv->sv_stats     = prog->pg_stats;
 	if (bufsize > RPCSVC_MAXPAYLOAD)
 		bufsize = RPCSVC_MAXPAYLOAD;
@@ -460,6 +464,7 @@ __svc_create(struct svc_program *prog, unsigned int bufsize, int npools,
 	init_timer(&serv->sv_temptimer);
 	spin_lock_init(&serv->sv_lock);
 
+	mutex_init(&serv->sv_pool_mutex);
 	serv->sv_nrpools = npools;
 	serv->sv_pools =
 		kcalloc(serv->sv_nrpools, sizeof(struct svc_pool),
@@ -492,10 +497,115 @@ svc_create(struct svc_program *prog, unsigned int bufsize,
 }
 EXPORT_SYMBOL_GPL(svc_create);
 
+static bool
+svc_pool_manager_should_sleep(struct svc_serv *serv, int nthreads)
+{
+	int i;
+
+	/* are we shutting down? */
+	if (kthread_should_stop())
+		return false;
+
+	/* are we freezing? */
+	if (freezing(current))
+		return false;
+
+	/* are we shutting down? */
+	if (nthreads == 0)
+		return true;
+
+	/* did someone want to create new threads? */
+	for (i = 0; i < serv->sv_nrpools; i++) {
+		struct svc_pool *pool = &serv->sv_pools[i];
+		if (pool->sp_tmpthreads < atomic_read(&pool->sp_need_rescue))
+			return false;
+	}
+	return true;
+}
+
+static int
+svc_pool_manager(void *data)
+{
+	struct svc_serv *serv = data;
+	int nthreads;
+	int i;
+
+	set_freezable();
+
+	dprintk("svc: starting pool manager for %s\n", serv->sv_name);
+
+	mutex_lock(&serv->sv_pool_mutex);
+	nthreads = svc_get_num_threads(serv, NULL);
+	while (true) {
+		set_current_state(TASK_INTERRUPTIBLE);
+		if (svc_pool_manager_should_sleep(serv, nthreads)) {
+			mutex_unlock(&serv->sv_pool_mutex);
+			schedule();
+			mutex_lock(&serv->sv_pool_mutex);
+		} else
+			__set_current_state(TASK_RUNNING);
+
+		if (kthread_should_stop()) {
+			dprintk("svc: stopping pool manager for %s\n",
+				 serv->sv_name);
+			break;
+		}
+		if (unlikely(freezing(current))) {
+			mutex_unlock(&serv->sv_pool_mutex);
+			try_to_freeze();
+			mutex_lock(&serv->sv_pool_mutex);
+		}
+
+		/* Detect shutdown */
+		nthreads = svc_get_num_threads(serv, NULL);
+		if (!nthreads)
+			continue;
+
+		for (i = 0; i < serv->sv_nrpools; i++) {
+			struct svc_pool *pool = &serv->sv_pools[i];
+			int cpu = svc_pool_map_get_node(i);
+			struct task_struct *task;
+			struct svc_rqst *rqstp;
+
+			if (pool->sp_tmpthreads >= atomic_read(&pool->sp_need_rescue))
+				continue;
+
+			rqstp = __svc_prepare_thread(serv, pool, cpu, true);
+			if (!rqstp) {
+				dprintk("svc: failed to prepare new thread\n");
+				break;
+			}
+			__module_get(serv->sv_module);
+			task = kthread_create_on_node(serv->sv_run_once, rqstp,
+						      cpu, "%s", serv->sv_name);
+			if (IS_ERR(task)) {
+				mutex_unlock(&serv->sv_pool_mutex);
+				module_put(serv->sv_module);
+				svc_exit_thread(rqstp);
+				dprintk("svc: failed to spawn new thread\n");
+				yield();
+				mutex_lock(&serv->sv_pool_mutex);
+				break;
+			}
+
+			rqstp->rq_task = task;
+			if (serv->sv_nrpools > 1)
+				svc_pool_map_set_cpumask(task, pool->sp_id);
+
+			svc_sock_update_bufs(serv);
+			wake_up_process(task);
+		}
+	}
+	mutex_unlock(&serv->sv_pool_mutex);
+
+	return 0;
+}
+
 struct svc_serv *
 svc_create_pooled(struct svc_program *prog, unsigned int bufsize,
 		  void (*shutdown)(struct svc_serv *serv, struct net *net),
-		  svc_thread_fn func, struct module *mod)
+		  svc_thread_fn run_once_func, svc_thread_fn svc_func,
+		  struct module *mod)
 {
 	struct svc_serv *serv;
 	unsigned int npools = svc_pool_map_get();
@@ -504,8 +614,19 @@ svc_create_pooled(struct svc_program *prog, unsigned int bufsize,
 	if (!serv)
 		goto out_err;
 
-	serv->sv_function = func;
+	serv->sv_function = svc_func;
 	serv->sv_module = mod;
+
+	if (run_once_func) {
+		serv->sv_run_once = run_once_func;
+		serv->sv_pool_mgr = kthread_run(svc_pool_manager,
+					serv, "%s-mgr", serv->sv_name);
+		if (IS_ERR(serv->sv_pool_mgr)) {
+			serv->sv_pool_mgr = NULL;
+			svc_destroy(serv);
+			return NULL;
+		}
+	}
 	return serv;
 out_err:
 	svc_pool_map_put();
@@ -524,22 +645,19 @@ EXPORT_SYMBOL_GPL(svc_shutdown_net);
 
 /*
  * Destroy an RPC service. Should be called with appropriate locking to
- * protect the sv_nrthreads, sv_permsocks and sv_tempsocks.
+ * protect the sv_refcount, sv_permsocks and sv_tempsocks.
  */
 void
 svc_destroy(struct svc_serv *serv)
 {
 	dprintk("svc: svc_destroy(%s, %d)\n",
 				serv->sv_program->pg_name,
-				serv->sv_nrthreads);
+				atomic_read(&serv->sv_refcount));
 
-	if (serv->sv_nrthreads) {
-		if (--(serv->sv_nrthreads) != 0) {
-			svc_sock_update_bufs(serv);
-			return;
-		}
-	} else
-		printk("svc_destroy: no threads for serv=%p!\n", serv);
+	if (!atomic_dec_and_test(&serv->sv_refcount)) {
+		svc_sock_update_bufs(serv);
+		return;
+	}
 
 	del_timer_sync(&serv->sv_temptimer);
 
@@ -552,8 +670,11 @@ svc_destroy(struct svc_serv *serv)
 
 	cache_clean_deferred(serv);
 
-	if (svc_serv_is_pooled(serv))
+	if (svc_serv_is_pooled(serv)) {
+		if (serv->sv_pool_mgr)
+			kthread_stop(serv->sv_pool_mgr);
 		svc_pool_map_put();
+	}
 
 	kfree(serv->sv_pools);
 	kfree(serv);
@@ -603,8 +724,10 @@ svc_release_buffer(struct svc_rqst *rqstp)
 			put_page(rqstp->rq_pages[i]);
 }
 
-struct svc_rqst *
-svc_prepare_thread(struct svc_serv *serv, struct svc_pool *pool, int node)
+static struct svc_rqst *
+__svc_prepare_thread(struct svc_serv *serv, struct svc_pool *pool, int node,
+		bool istmp)
+	__must_hold(&serv->sv_pool_mutex)
 {
 	struct svc_rqst	*rqstp;
 
@@ -612,12 +735,16 @@ svc_prepare_thread(struct svc_serv *serv, struct svc_pool *pool, int node)
 	if (!rqstp)
 		goto out_enomem;
 
-	serv->sv_nrthreads++;
+	svc_get(serv);
 	__set_bit(RQ_BUSY, &rqstp->rq_flags);
 	spin_lock_init(&rqstp->rq_lock);
 	rqstp->rq_server = serv;
 	rqstp->rq_pool = pool;
 	spin_lock_bh(&pool->sp_lock);
+	if (istmp) {
+		__set_bit(RQ_RESCUE, &rqstp->rq_flags);
+		pool->sp_tmpthreads++;
+	}
 	pool->sp_nrthreads++;
 	list_add_rcu(&rqstp->rq_all, &pool->sp_all_threads);
 	spin_unlock_bh(&pool->sp_lock);
@@ -635,9 +762,22 @@ svc_prepare_thread(struct svc_serv *serv, struct svc_pool *pool, int node)
 
 	return rqstp;
 out_thread:
+	mutex_unlock(&serv->sv_pool_mutex);
 	svc_exit_thread(rqstp);
+	mutex_lock(&serv->sv_pool_mutex);
 out_enomem:
 	return ERR_PTR(-ENOMEM);
+}
+
+struct svc_rqst *
+svc_prepare_thread(struct svc_serv *serv, struct svc_pool *pool, int node)
+{
+	struct svc_rqst *rqstp;
+
+	mutex_lock(&serv->sv_pool_mutex);
+	rqstp = __svc_prepare_thread(serv, pool, node, false);
+	mutex_unlock(&serv->sv_pool_mutex);
+	return rqstp;
 }
 EXPORT_SYMBOL_GPL(svc_prepare_thread);
 
@@ -669,7 +809,7 @@ choose_victim(struct svc_serv *serv, struct svc_pool *pool, unsigned int *state)
 		for (i = 0; i < serv->sv_nrpools; i++) {
 			pool = &serv->sv_pools[--(*state) % serv->sv_nrpools];
 			spin_lock_bh(&pool->sp_lock);
-			if (!list_empty(&pool->sp_all_threads))
+			if (pool->sp_nrthreads != pool->sp_tmpthreads)
 				goto found_pool;
 			spin_unlock_bh(&pool->sp_lock);
 		}
@@ -684,15 +824,59 @@ found_pool:
 		 * Remove from the pool->sp_all_threads list
 		 * so we don't try to kill it again.
 		 */
-		rqstp = list_entry(pool->sp_all_threads.next, struct svc_rqst, rq_all);
-		set_bit(RQ_VICTIM, &rqstp->rq_flags);
-		list_del_rcu(&rqstp->rq_all);
-		task = rqstp->rq_task;
+		list_for_each_entry_rcu(rqstp, &pool->sp_all_threads, rq_all) {
+			if (test_bit(RQ_RESCUE, &rqstp->rq_flags))
+				continue;
+			task = rqstp->rq_task;
+			if (!task)
+				continue;
+			set_bit(RQ_VICTIM, &rqstp->rq_flags);
+			list_del_rcu(&rqstp->rq_all);
+			get_task_struct(task);
+		}
 	}
 	spin_unlock_bh(&pool->sp_lock);
 
 	return task;
 }
+
+static int
+svc_pool_count_threads(struct svc_pool *pool)
+{
+	int ret;
+
+	spin_lock_bh(&pool->sp_lock);
+	ret = pool->sp_nrthreads - pool->sp_tmpthreads;
+	spin_unlock_bh(&pool->sp_lock);
+	return ret;
+}
+
+static int
+svc_serv_count_threads(struct svc_serv *serv)
+{
+	int i, ret = 0;
+
+	for (i = 0; i < serv->sv_nrpools; i++)
+		ret += svc_pool_count_threads(&serv->sv_pools[i]);
+	return ret;
+}
+
+/*
+ * Count the number of threads, excluding emergency threads.
+ * If `pool' is non-NULL, applies only to threads in that pool.
+ *
+ * The caller is expected to ensure exclusion between this and server
+ * startup or shutdown.
+ */
+int
+svc_get_num_threads(struct svc_serv *serv, struct svc_pool *pool)
+{
+
+	if (pool != NULL)
+		return svc_pool_count_threads(pool);
+	return svc_serv_count_threads(serv);
+}
+EXPORT_SYMBOL_GPL(svc_get_num_threads);
 
 /*
  * Create or destroy enough new threads to make the number
@@ -715,17 +899,10 @@ svc_set_num_threads(struct svc_serv *serv, struct svc_pool *pool, int nrservs)
 	struct task_struct *task;
 	struct svc_pool *chosen_pool;
 	int error = 0;
-	unsigned int state = serv->sv_nrthreads-1;
+	unsigned int state = atomic_read(&serv->sv_refcount)-1;
 	int node;
 
-	if (pool == NULL) {
-		/* The -1 assumes caller has done a svc_get() */
-		nrservs -= (serv->sv_nrthreads-1);
-	} else {
-		spin_lock_bh(&pool->sp_lock);
-		nrservs -= pool->sp_nrthreads;
-		spin_unlock_bh(&pool->sp_lock);
-	}
+	nrservs -= svc_get_num_threads(serv, pool);
 
 	/* create new threads */
 	while (nrservs > 0) {
@@ -760,9 +937,9 @@ svc_set_num_threads(struct svc_serv *serv, struct svc_pool *pool, int nrservs)
 	while (nrservs < 0 &&
 	       (task = choose_victim(serv, pool, &state)) != NULL) {
 		send_sig(SIGINT, task, 1);
+		put_task_struct(task);
 		nrservs++;
 	}
-
 	return error;
 }
 EXPORT_SYMBOL_GPL(svc_set_num_threads);
@@ -782,17 +959,24 @@ svc_exit_thread(struct svc_rqst *rqstp)
 	kfree(rqstp->rq_argp);
 	kfree(rqstp->rq_auth_data);
 
+	mutex_lock(&serv->sv_pool_mutex);
 	spin_lock_bh(&pool->sp_lock);
 	pool->sp_nrthreads--;
+	if (test_bit(RQ_RESCUE, &rqstp->rq_flags)) {
+		pool->sp_tmpthreads--;
+		/* Handle races with svc_xprt_do_enqueue() */
+		if (pool->sp_tmpthreads < atomic_read(&pool->sp_need_rescue))
+			wake_up_process(serv->sv_pool_mgr);
+	}
 	if (!test_and_set_bit(RQ_VICTIM, &rqstp->rq_flags))
 		list_del_rcu(&rqstp->rq_all);
 	spin_unlock_bh(&pool->sp_lock);
+	mutex_unlock(&serv->sv_pool_mutex);
 
 	kfree_rcu(rqstp, rq_rcu_head);
 
 	/* Release the server */
-	if (serv)
-		svc_destroy(serv);
+	svc_destroy(serv);
 }
 EXPORT_SYMBOL_GPL(svc_exit_thread);
 
@@ -1290,7 +1474,6 @@ err_bad:
 	svc_putnl(resv, ntohl(rpc_stat));
 	goto sendit;
 }
-EXPORT_SYMBOL_GPL(svc_process);
 
 /*
  * Process the RPC request.
@@ -1338,6 +1521,7 @@ out_drop:
 	svc_drop(rqstp);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(svc_process);
 
 #if defined(CONFIG_SUNRPC_BACKCHANNEL)
 /*
@@ -1350,6 +1534,11 @@ bc_svc_process(struct svc_serv *serv, struct rpc_rqst *req,
 {
 	struct kvec	*argv = &rqstp->rq_arg.head[0];
 	struct kvec	*resv = &rqstp->rq_res.head[0];
+	struct rpc_task *task;
+	int proc_error;
+	int error;
+
+	dprintk("svc: %s(%p)\n", __func__, req);
 
 	/* Build the svc_rqst used by the common processing routine */
 	rqstp->rq_xprt = serv->sv_bc_xprt;
@@ -1362,6 +1551,19 @@ bc_svc_process(struct svc_serv *serv, struct rpc_rqst *req,
 	memcpy(&rqstp->rq_arg, &req->rq_rcv_buf, sizeof(rqstp->rq_arg));
 	memcpy(&rqstp->rq_res, &req->rq_snd_buf, sizeof(rqstp->rq_res));
 
+	/* Adjust the argument buffer length */
+	rqstp->rq_arg.len = req->rq_private_buf.len;
+	if (rqstp->rq_arg.len <= rqstp->rq_arg.head[0].iov_len) {
+		rqstp->rq_arg.head[0].iov_len = rqstp->rq_arg.len;
+		rqstp->rq_arg.page_len = 0;
+	} else if (rqstp->rq_arg.len <= rqstp->rq_arg.head[0].iov_len +
+			rqstp->rq_arg.page_len)
+		rqstp->rq_arg.page_len = rqstp->rq_arg.len -
+			rqstp->rq_arg.head[0].iov_len;
+	else
+		rqstp->rq_arg.len = rqstp->rq_arg.head[0].iov_len +
+			rqstp->rq_arg.page_len;
+
 	/* reset result send buffer "put" position */
 	resv->iov_len = 0;
 
@@ -1372,21 +1574,36 @@ bc_svc_process(struct svc_serv *serv, struct rpc_rqst *req,
 
 	/*
 	 * Skip the next two words because they've already been
-	 * processed in the trasport
+	 * processed in the transport
 	 */
 	svc_getu32(argv);	/* XID */
 	svc_getnl(argv);	/* CALLDIR */
 
-	/* Returns 1 for send, 0 for drop */
-	if (svc_process_common(rqstp, argv, resv)) {
-		memcpy(&req->rq_snd_buf, &rqstp->rq_res,
-						sizeof(req->rq_snd_buf));
-		return bc_send(req);
-	} else {
-		/* drop request */
+	/* Parse and execute the bc call */
+	proc_error = svc_process_common(rqstp, argv, resv);
+
+	atomic_inc(&req->rq_xprt->bc_free_slots);
+	if (!proc_error) {
+		/* Processing error: drop the request */
 		xprt_free_bc_request(req);
 		return 0;
 	}
+
+	/* Finally, send the reply synchronously */
+	memcpy(&req->rq_snd_buf, &rqstp->rq_res, sizeof(req->rq_snd_buf));
+	task = rpc_run_bc_task(req);
+	if (IS_ERR(task)) {
+		error = PTR_ERR(task);
+		goto out;
+	}
+
+	WARN_ON_ONCE(atomic_read(&task->tk_count) != 1);
+	error = task->tk_status;
+	rpc_put_task(task);
+
+out:
+	dprintk("svc: %s(), error=%d\n", __func__, error);
+	return error;
 }
 EXPORT_SYMBOL_GPL(bc_svc_process);
 #endif /* CONFIG_SUNRPC_BACKCHANNEL */

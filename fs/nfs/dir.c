@@ -414,12 +414,17 @@ static int xdr_decode(nfs_readdir_descriptor_t *desc,
 static
 int nfs_same_file(struct dentry *dentry, struct nfs_entry *entry)
 {
+	struct inode *inode;
 	struct nfs_inode *nfsi;
 
 	if (d_really_is_negative(dentry))
 		return 0;
 
-	nfsi = NFS_I(d_inode(dentry));
+	inode = d_inode(dentry);
+	if (is_bad_inode(inode) || NFS_STALE(inode))
+		return 0;
+
+	nfsi = NFS_I(inode);
 	if (entry->fattr->fileid == nfsi->fileid)
 		return 1;
 	if (nfs_compare_fh(entry->fh, &nfsi->fh) == 0)
@@ -1470,9 +1475,6 @@ static int nfs_finish_open(struct nfs_open_context *ctx,
 {
 	int err;
 
-	if ((open_flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL))
-		*opened |= FILE_CREATED;
-
 	err = finish_open(file, dentry, do_open, opened);
 	if (err)
 		goto out;
@@ -1542,10 +1544,10 @@ int nfs_atomic_open(struct inode *dir, struct dentry *dentry,
 		err = PTR_ERR(inode);
 		trace_nfs_atomic_open_exit(dir, ctx, open_flags, err);
 		put_nfs_open_context(ctx);
+		d_drop(dentry);
 		switch (err) {
 		case -ENOENT:
-			d_drop(dentry);
-			d_add(dentry, NULL);
+			d_splice_alias(NULL, dentry);
 			nfs_set_verifier(dentry, nfs_save_change_attribute(dir));
 			break;
 		case -EISDIR:
@@ -2237,21 +2239,37 @@ static struct nfs_access_entry *nfs_access_search_rbtree(struct inode *inode, st
 	return NULL;
 }
 
-static int nfs_access_get_cached(struct inode *inode, struct rpc_cred *cred, struct nfs_access_entry *res)
+static int nfs_access_get_cached(struct inode *inode, struct rpc_cred *cred, struct nfs_access_entry *res, bool may_block)
 {
 	struct nfs_inode *nfsi = NFS_I(inode);
 	struct nfs_access_entry *cache;
-	int err = -ENOENT;
+	bool retry = true;
+	int err;
 
 	spin_lock(&inode->i_lock);
-	if (nfsi->cache_validity & NFS_INO_INVALID_ACCESS)
-		goto out_zap;
-	cache = nfs_access_search_rbtree(inode, cred);
-	if (cache == NULL)
-		goto out;
-	if (!nfs_have_delegated_attributes(inode) &&
-	    !time_in_range_open(jiffies, cache->jiffies, cache->jiffies + nfsi->attrtimeo))
-		goto out_stale;
+	for(;;) {
+		if (nfsi->cache_validity & NFS_INO_INVALID_ACCESS)
+			goto out_zap;
+		cache = nfs_access_search_rbtree(inode, cred);
+		err = -ENOENT;
+		if (cache == NULL)
+			goto out;
+		/* Found an entry, is our attribute cache valid? */
+		if (!nfs_attribute_cache_expired(inode) &&
+		    !(nfsi->cache_validity & NFS_INO_INVALID_ATTR))
+			break;
+		err = -ECHILD;
+		if (!may_block)
+			goto out;
+		if (!retry)
+			goto out_zap;
+		spin_unlock(&inode->i_lock);
+		err = __nfs_revalidate_inode(NFS_SERVER(inode), inode);
+		if (err)
+			return err;
+		spin_lock(&inode->i_lock);
+		retry = false;
+	}
 	res->jiffies = cache->jiffies;
 	res->cred = cache->cred;
 	res->mask = cache->mask;
@@ -2260,12 +2278,6 @@ static int nfs_access_get_cached(struct inode *inode, struct rpc_cred *cred, str
 out:
 	spin_unlock(&inode->i_lock);
 	return err;
-out_stale:
-	rb_erase(&cache->rb_node, &nfsi->access_cache);
-	list_del(&cache->lru);
-	spin_unlock(&inode->i_lock);
-	nfs_access_free_entry(cache);
-	return -ENOENT;
 out_zap:
 	spin_unlock(&inode->i_lock);
 	nfs_access_zap_cache(inode);
@@ -2292,13 +2304,12 @@ static int nfs_access_get_cached_rcu(struct inode *inode, struct rpc_cred *cred,
 		cache = NULL;
 	if (cache == NULL)
 		goto out;
-	if (!nfs_have_delegated_attributes(inode) &&
-	    !time_in_range_open(jiffies, cache->jiffies, cache->jiffies + nfsi->attrtimeo))
+	err = nfs_revalidate_inode_rcu(NFS_SERVER(inode), inode);
+	if (err)
 		goto out;
 	res->jiffies = cache->jiffies;
 	res->cred = cache->cred;
 	res->mask = cache->mask;
-	err = 0;
 out:
 	rcu_read_unlock();
 	return err;
@@ -2387,18 +2398,19 @@ EXPORT_SYMBOL_GPL(nfs_access_set_mask);
 static int nfs_do_access(struct inode *inode, struct rpc_cred *cred, int mask)
 {
 	struct nfs_access_entry cache;
+	bool may_block = (mask & MAY_NOT_BLOCK) == 0;
 	int status;
 
 	trace_nfs_access_enter(inode);
 
 	status = nfs_access_get_cached_rcu(inode, cred, &cache);
 	if (status != 0)
-		status = nfs_access_get_cached(inode, cred, &cache);
+		status = nfs_access_get_cached(inode, cred, &cache, may_block);
 	if (status == 0)
 		goto out_cached;
 
 	status = -ECHILD;
-	if (mask & MAY_NOT_BLOCK)
+	if (!may_block)
 		goto out;
 
 	/* Be clever: ask server to check for all possible rights */
@@ -2446,6 +2458,20 @@ int nfs_may_open(struct inode *inode, struct rpc_cred *cred, int openflags)
 }
 EXPORT_SYMBOL_GPL(nfs_may_open);
 
+static int nfs_execute_ok(struct inode *inode, int mask)
+{
+	struct nfs_server *server = NFS_SERVER(inode);
+	int ret;
+
+	if (mask & MAY_NOT_BLOCK)
+		ret = nfs_revalidate_inode_rcu(server, inode);
+	else
+		ret = nfs_revalidate_inode(server, inode);
+	if (ret == 0 && !execute_ok(inode))
+		ret = -EACCES;
+	return ret;
+}
+
 int nfs_permission(struct inode *inode, int mask)
 {
 	struct rpc_cred *cred;
@@ -2463,6 +2489,9 @@ int nfs_permission(struct inode *inode, int mask)
 		case S_IFLNK:
 			goto out;
 		case S_IFREG:
+			if ((mask & MAY_OPEN) &&
+			   nfs_server_capable(inode, NFS_CAP_ATOMIC_OPEN))
+				return 0;
 			break;
 		case S_IFDIR:
 			/*
@@ -2495,8 +2524,8 @@ force_lookup:
 			res = PTR_ERR(cred);
 	}
 out:
-	if (!res && (mask & MAY_EXEC) && !execute_ok(inode))
-		res = -EACCES;
+	if (!res && (mask & MAY_EXEC))
+		res = nfs_execute_ok(inode, mask);
 
 	dfprintk(VFS, "NFS: permission(%s/%lu), mask=0x%x, res=%d\n",
 		inode->i_sb->s_id, inode->i_ino, mask, res);

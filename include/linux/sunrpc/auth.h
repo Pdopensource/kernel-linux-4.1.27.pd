@@ -12,15 +12,20 @@
 #ifdef __KERNEL__
 
 #include <linux/sunrpc/sched.h>
+#include <linux/sunrpc/svcauth.h>
 #include <linux/sunrpc/msg_prot.h>
 #include <linux/sunrpc/xdr.h>
 
 #include <linux/atomic.h>
 #include <linux/rcupdate.h>
 #include <linux/uidgid.h>
+#include <linux/utsname.h>
 
-/* size of the nodename buffer */
-#define UNX_MAXNODENAME	32
+/*
+ * Size of the nodename buffer. RFC1831 specifies a hard limit of 255 bytes,
+ * but Linux hostnames are actually limited to __NEW_UTS_LEN bytes.
+ */
+#define UNX_MAXNODENAME	__NEW_UTS_LEN
 
 struct rpcsec_gss_info;
 
@@ -116,7 +121,7 @@ struct rpc_authops {
 	void			(*destroy)(struct rpc_auth *);
 
 	struct rpc_cred *	(*lookup_cred)(struct rpc_auth *, struct auth_cred *, int);
-	struct rpc_cred *	(*crcreate)(struct rpc_auth*, struct auth_cred *, int);
+	struct rpc_cred *	(*crcreate)(struct rpc_auth*, struct auth_cred *, int, gfp_t);
 	int			(*list_pseudoflavors)(rpc_authflavor_t *, int);
 	rpc_authflavor_t	(*info2flavor)(struct rpcsec_gss_info *);
 	int			(*flavor2info)(rpc_authflavor_t,
@@ -141,6 +146,9 @@ struct rpc_credops {
 						void *, __be32 *, void *);
 	int			(*crkey_timeout)(struct rpc_cred *);
 	bool			(*crkey_to_expire)(struct rpc_cred *);
+	bool			(*crmap_to_svc_cred)(struct rpc_auth *,
+						     struct rpc_cred *,
+						     struct svc_cred *);
 	char *			(*crstringify_acceptor)(struct rpc_cred *);
 };
 
@@ -156,6 +164,7 @@ void 			rpc_destroy_authunix(void);
 
 struct rpc_cred *	rpc_lookup_cred(void);
 struct rpc_cred *	rpc_lookup_cred_nonblock(void);
+struct rpc_cred *	rpc_lookup_generic_cred(struct auth_cred *, int, gfp_t);
 struct rpc_cred *	rpc_lookup_machine_cred(const char *service_name);
 int			rpcauth_register(const struct rpc_authops *);
 int			rpcauth_unregister(const struct rpc_authops *);
@@ -167,7 +176,7 @@ rpc_authflavor_t	rpcauth_get_pseudoflavor(rpc_authflavor_t,
 int			rpcauth_get_gssinfo(rpc_authflavor_t,
 				struct rpcsec_gss_info *);
 int			rpcauth_list_flavors(rpc_authflavor_t *, int);
-struct rpc_cred *	rpcauth_lookup_credcache(struct rpc_auth *, struct auth_cred *, int);
+struct rpc_cred *	rpcauth_lookup_credcache(struct rpc_auth *, struct auth_cred *, int, gfp_t);
 void			rpcauth_init_cred(struct rpc_cred *, const struct auth_cred *, struct rpc_auth *, const struct rpc_credops *);
 struct rpc_cred *	rpcauth_lookupcred(struct rpc_auth *, int);
 struct rpc_cred *	rpcauth_generic_bind_cred(struct rpc_task *, struct rpc_cred *, int);
@@ -185,6 +194,9 @@ void			rpcauth_clear_credcache(struct rpc_cred_cache *);
 int			rpcauth_key_timeout_notify(struct rpc_auth *,
 						struct rpc_cred *);
 bool			rpcauth_cred_key_to_expire(struct rpc_cred *);
+bool			rpcauth_map_to_svc_cred(struct rpc_auth *,
+						struct rpc_cred *,
+						struct svc_cred *);
 char *			rpcauth_stringify_acceptor(struct rpc_cred *);
 
 static inline
@@ -192,6 +204,24 @@ struct rpc_cred *	get_rpccred(struct rpc_cred *cred)
 {
 	atomic_inc(&cred->cr_count);
 	return cred;
+}
+
+/**
+ * get_rpccred_rcu - get a reference to a cred using rcu-protected pointer
+ * @cred: cred of which to take a reference
+ *
+ * In some cases, we may have a pointer to a credential to which we
+ * want to take a reference, but don't already have one. Because these
+ * objects are freed using RCU, we can access the cr_count while its
+ * on its way to destruction and only take a reference if it's not already
+ * zero.
+ */
+static inline struct rpc_cred *
+get_rpccred_rcu(struct rpc_cred *cred)
+{
+	if (atomic_inc_not_zero(&cred->cr_count))
+		return cred;
+	return NULL;
 }
 
 #endif /* __KERNEL__ */

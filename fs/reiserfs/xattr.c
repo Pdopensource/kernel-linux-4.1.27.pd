@@ -756,7 +756,8 @@ find_xattr_handler_prefix(const struct xattr_handler **handlers,
 		return NULL;
 
 	for_each_xattr_handler(handlers, xah) {
-		if (strncmp(xah->prefix, name, strlen(xah->prefix)) == 0)
+		const char *prefix = xattr_prefix(xah);
+		if (strncmp(prefix, name, strlen(prefix)) == 0)
 			break;
 	}
 
@@ -778,7 +779,7 @@ reiserfs_getxattr(struct dentry * dentry, const char *name, void *buffer,
 	if (!handler || get_inode_sd_version(d_inode(dentry)) == STAT_DATA_V1)
 		return -EOPNOTSUPP;
 
-	return handler->get(dentry, name, buffer, size, handler->flags);
+	return handler->get(handler, dentry, name, buffer, size);
 }
 
 /*
@@ -797,7 +798,7 @@ reiserfs_setxattr(struct dentry *dentry, const char *name, const void *value,
 	if (!handler || get_inode_sd_version(d_inode(dentry)) == STAT_DATA_V1)
 		return -EOPNOTSUPP;
 
-	return handler->set(dentry, name, value, size, flags, handler->flags);
+	return handler->set(handler, dentry, name, value, size, flags);
 }
 
 /*
@@ -814,7 +815,7 @@ int reiserfs_removexattr(struct dentry *dentry, const char *name)
 	if (!handler || get_inode_sd_version(d_inode(dentry)) == STAT_DATA_V1)
 		return -EOPNOTSUPP;
 
-	return handler->set(dentry, name, NULL, 0, XATTR_REPLACE, handler->flags);
+	return handler->set(handler, dentry, name, NULL, 0, XATTR_REPLACE);
 }
 
 struct listxattr_buf {
@@ -839,19 +840,16 @@ static int listxattr_filler(struct dir_context *ctx, const char *name,
 
 		handler = find_xattr_handler_prefix(b->dentry->d_sb->s_xattr,
 						    name);
-		if (!handler)	/* Unsupported xattr name */
+		if (!handler /* Unsupported xattr name */ ||
+		    (handler->list && !handler->list(b->dentry)))
 			return 0;
+		size = namelen + 1;
 		if (b->buf) {
-			size = handler->list(b->dentry, b->buf + b->pos,
-					 b->size, name, namelen,
-					 handler->flags);
 			if (size > b->size)
 				return -ERANGE;
-		} else {
-			size = handler->list(b->dentry, NULL, 0, name,
-					     namelen, handler->flags);
+			memcpy(b->buf + b->pos, name, namelen);
+			b->buf[b->pos + namelen] = 0;
 		}
-
 		b->pos += size;
 	}
 	return 0;

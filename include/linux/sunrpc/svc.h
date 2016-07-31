@@ -47,11 +47,14 @@ struct svc_pool {
 	spinlock_t		sp_lock;	/* protects all fields */
 	struct list_head	sp_sockets;	/* pending sockets */
 	unsigned int		sp_nrthreads;	/* # of threads in pool */
+	unsigned int		sp_tmpthreads;	/* # of tmp threads in pool */
 	struct list_head	sp_all_threads;	/* all server threads */
 	struct svc_pool_stats	sp_stats;	/* statistics on pool operation */
 #define	SP_TASK_PENDING		(0)		/* still work to do even if no
 						 * xprt is queued. */
 	unsigned long		sp_flags;
+	atomic_t		sp_need_rescue;	/* # of queued xprts that
+						 * might need rescuing */
 } ____cacheline_aligned_in_smp;
 
 /*
@@ -68,14 +71,14 @@ struct svc_serv {
 	struct svc_program *	sv_program;	/* RPC program */
 	struct svc_stat *	sv_stats;	/* RPC statistics */
 	spinlock_t		sv_lock;
-	unsigned int		sv_nrthreads;	/* # of server threads */
+	atomic_t		sv_refcount;	/* refcount */
 	unsigned int		sv_maxconn;	/* max connections allowed or
 						 * '0' causing max to be based
 						 * on number of threads. */
-
 	unsigned int		sv_max_payload;	/* datagram payload size */
 	unsigned int		sv_max_mesg;	/* max_payload + 1 page for overheads */
 	unsigned int		sv_xdrsize;	/* XDR buffer size */
+	unsigned int		sv_max_inflight;/* max number of in-flight RPCs per xprt */
 	struct list_head	sv_permsocks;	/* all permanent sockets */
 	struct list_head	sv_tempsocks;	/* all temporary sockets */
 	int			sv_tmpcnt;	/* count of temporary sockets */
@@ -83,8 +86,10 @@ struct svc_serv {
 
 	char *			sv_name;	/* service name */
 
+	struct mutex		sv_pool_mutex;	/* Protect thread create/destroy */
 	unsigned int		sv_nrpools;	/* number of thread pools */
 	struct svc_pool *	sv_pools;	/* array of thread pools */
+	struct task_struct	*sv_pool_mgr;	/* pool manager thread */
 
 	void			(*sv_shutdown)(struct svc_serv *serv,
 					       struct net *net);
@@ -95,6 +100,10 @@ struct svc_serv {
 	struct module *		sv_module;	/* optional module to count when
 						 * adding threads */
 	svc_thread_fn		sv_function;	/* main function for threads */
+	svc_thread_fn		sv_run_once;	/* service function that does the same
+						 * as sv_function yet only run for a while.
+						 * Use by pool manager to dynamically increase
+						 * # of threads in a pool */
 #if defined(CONFIG_SUNRPC_BACKCHANNEL)
 	struct list_head	sv_cb_list;	/* queue for callback requests
 						 * that arrive over the same
@@ -107,14 +116,14 @@ struct svc_serv {
 };
 
 /*
- * We use sv_nrthreads as a reference count.  svc_destroy() drops
+ * We use sv_refcount as a reference count.  svc_destroy() drops
  * this refcount, so we need to bump it up around operations that
  * change the number of threads.  Horrible, but there it is.
  * Should be called with the "service mutex" held.
  */
 static inline void svc_get(struct svc_serv *serv)
 {
-	serv->sv_nrthreads++;
+	atomic_inc(&serv->sv_refcount);
 }
 
 /*
@@ -263,6 +272,8 @@ struct svc_rqst {
 						 * cache pages */
 #define	RQ_VICTIM	(5)			/* about to be shut down */
 #define	RQ_BUSY		(6)			/* request is busy */
+#define	RQ_DATA		(7)			/* request has data */
+#define	RQ_RESCUE	(8)			/* Rescue thread */
 	unsigned long		rq_flags;	/* flags field */
 
 	void *			rq_argp;	/* decoded arguments */
@@ -435,8 +446,9 @@ struct svc_rqst *svc_prepare_thread(struct svc_serv *serv,
 void		   svc_exit_thread(struct svc_rqst *);
 struct svc_serv *  svc_create_pooled(struct svc_program *, unsigned int,
 			void (*shutdown)(struct svc_serv *, struct net *net),
-			svc_thread_fn, struct module *);
+			svc_thread_fn, svc_thread_fn, struct module *);
 int		   svc_set_num_threads(struct svc_serv *, struct svc_pool *, int);
+int		   svc_get_num_threads(struct svc_serv *, struct svc_pool *);
 int		   svc_pool_stats_open(struct svc_serv *serv, struct file *file);
 void		   svc_destroy(struct svc_serv *);
 void		   svc_shutdown_net(struct svc_serv *, struct net *);

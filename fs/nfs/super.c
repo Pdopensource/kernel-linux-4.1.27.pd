@@ -2201,7 +2201,7 @@ nfs_compare_remount_data(struct nfs_server *nfss,
 	    data->nfs_server.port != nfss->port ||
 	    data->nfs_server.addrlen != nfss->nfs_client->cl_addrlen ||
 	    !rpc_cmp_addr((struct sockaddr *)&data->nfs_server.address,
-			  (struct sockaddr *)&nfss->nfs_client->cl_addr))
+			  (struct sockaddr *)&nfss->nfs_client->cl_addr, false))
 		return -EINVAL;
 
 	return 0;
@@ -2316,8 +2316,9 @@ void nfs_fill_super(struct super_block *sb, struct nfs_mount_info *mount_info)
 		/* The VFS shouldn't apply the umask to mode bits. We will do
 		 * so ourselves when necessary.
 		 */
-		sb->s_flags |= MS_POSIXACL;
+		sb->s_flags |= MS_RICHACL;
 		sb->s_time_gran = 1;
+		sb->s_export_op = &nfs_export_ops;
 	}
 
  	nfs_initialise_sb(sb);
@@ -2338,12 +2339,13 @@ void nfs_clone_super(struct super_block *sb, struct nfs_mount_info *mount_info)
 	sb->s_xattr = old_sb->s_xattr;
 	sb->s_op = old_sb->s_op;
 	sb->s_time_gran = 1;
+	sb->s_export_op = old_sb->s_export_op;
 
 	if (server->nfs_client->rpc_ops->version != 2) {
 		/* The VFS shouldn't apply the umask to mode bits. We will do
 		 * so ourselves when necessary.
 		 */
-		sb->s_flags |= MS_POSIXACL;
+		sb->s_flags |= MS_RICHACL;
 	}
 
  	nfs_initialise_sb(sb);

@@ -16,29 +16,6 @@
 #include <linux/uidgid.h>
 #include <uapi/linux/nfs4.h>
 
-enum nfs4_acl_whotype {
-	NFS4_ACL_WHO_NAMED = 0,
-	NFS4_ACL_WHO_OWNER,
-	NFS4_ACL_WHO_GROUP,
-	NFS4_ACL_WHO_EVERYONE,
-};
-
-struct nfs4_ace {
-	uint32_t	type;
-	uint32_t	flag;
-	uint32_t	access_mask;
-	int		whotype;
-	union {
-		kuid_t	who_uid;
-		kgid_t	who_gid;
-	};
-};
-
-struct nfs4_acl {
-	uint32_t	naces;
-	struct nfs4_ace	aces[0];
-};
-
 #define NFS4_MAXLABELLEN	2048
 
 struct nfs4_label {
@@ -130,6 +107,7 @@ enum nfs_opnum4 {
 	OP_READ_PLUS = 68,
 	OP_SEEK = 69,
 	OP_WRITE_SAME = 70,
+	OP_CLONE = 71,
 
 	OP_ILLEGAL = 10044,
 };
@@ -417,10 +395,12 @@ enum lock_type4 {
 #define FATTR4_WORD1_TIME_MODIFY        (1UL << 21)
 #define FATTR4_WORD1_TIME_MODIFY_SET    (1UL << 22)
 #define FATTR4_WORD1_MOUNTED_ON_FILEID  (1UL << 23)
+#define FATTR4_WORD1_DACL               (1UL << 26)
 #define FATTR4_WORD1_FS_LAYOUT_TYPES    (1UL << 30)
 #define FATTR4_WORD2_LAYOUT_TYPES       (1UL << 0)
 #define FATTR4_WORD2_LAYOUT_BLKSIZE     (1UL << 1)
 #define FATTR4_WORD2_MDSTHRESHOLD       (1UL << 4)
+#define FATTR4_WORD2_CLONE_BLKSIZE	(1UL << 13)
 #define FATTR4_WORD2_SECURITY_LABEL     (1UL << 16)
 
 /* MDS threshold bitmap bits */
@@ -459,6 +439,7 @@ enum {
 	NFSPROC4_CLNT_ACCESS,
 	NFSPROC4_CLNT_GETATTR,
 	NFSPROC4_CLNT_LOOKUP,
+	NFSPROC4_CLNT_LOOKUPP,
 	NFSPROC4_CLNT_LOOKUP_ROOT,
 	NFSPROC4_CLNT_REMOVE,
 	NFSPROC4_CLNT_RENAME,
@@ -500,6 +481,8 @@ enum {
 	NFSPROC4_CLNT_SEEK,
 	NFSPROC4_CLNT_ALLOCATE,
 	NFSPROC4_CLNT_DEALLOCATE,
+	NFSPROC4_CLNT_LAYOUTSTATS,
+	NFSPROC4_CLNT_CLONE,
 };
 
 /* nfs41 types */
@@ -568,6 +551,22 @@ struct nfs4_deviceid {
 enum data_content4 {
 	NFS4_CONTENT_DATA		= 0,
 	NFS4_CONTENT_HOLE		= 1,
+};
+
+enum pnfs_update_layout_reason {
+	PNFS_UPDATE_LAYOUT_UNKNOWN = 0,
+	PNFS_UPDATE_LAYOUT_NO_PNFS,
+	PNFS_UPDATE_LAYOUT_RD_ZEROLEN,
+	PNFS_UPDATE_LAYOUT_MDSTHRESH,
+	PNFS_UPDATE_LAYOUT_NOMEM,
+	PNFS_UPDATE_LAYOUT_BULK_RECALL,
+	PNFS_UPDATE_LAYOUT_IO_TEST_FAIL,
+	PNFS_UPDATE_LAYOUT_FOUND_CACHED,
+	PNFS_UPDATE_LAYOUT_RETURN,
+	PNFS_UPDATE_LAYOUT_RETRY,
+	PNFS_UPDATE_LAYOUT_BLOCKED,
+	PNFS_UPDATE_LAYOUT_INVALID_OPEN,
+	PNFS_UPDATE_LAYOUT_SEND_LAYOUTGET,
 };
 
 #endif

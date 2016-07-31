@@ -36,18 +36,21 @@ struct nfs_client {
 #define NFS_CS_RENEWD		3		/* - renewd started */
 #define NFS_CS_STOP_RENEW	4		/* no more state to renew */
 #define NFS_CS_CHECK_LEASE_TIME	5		/* need to check lease time */
+#define NFS_CS_NOXUID		6		/* don't use idmap xuid / xgid */
 	unsigned long		cl_flags;	/* behavior switches */
 #define NFS_CS_NORESVPORT	0		/* - use ephemeral src port */
 #define NFS_CS_DISCRTRY		1		/* - disconnect on RPC retry */
 #define NFS_CS_MIGRATION	2		/* - transparent state migr */
 #define NFS_CS_INFINITE_SLOTS	3		/* - don't limit TCP slots */
 #define NFS_CS_NO_RETRANS_TIMEOUT	4	/* - Disable retransmit timeouts */
+#define NFS_CS_LOCAL_IO		5		/* - client is local */
 	struct sockaddr_storage	cl_addr;	/* server identifier */
 	size_t			cl_addrlen;
 	char *			cl_hostname;	/* hostname of server */
 	char *			cl_acceptor;	/* GSSAPI acceptor name */
 	struct list_head	cl_share_link;	/* link in global client list */
 	struct list_head	cl_superblocks;	/* List of nfs_server structs */
+	struct list_head	cl_local_addrs;	/* List of local addresses */
 
 	struct rpc_clnt *	cl_rpcclient;
 	const struct nfs_rpc_ops *rpc_ops;	/* NFS protocol vector */
@@ -147,6 +150,7 @@ struct nfs_server {
 	unsigned int		acdirmax;
 	unsigned int		namelen;
 	unsigned int		options;	/* extra options enabled by mount */
+	unsigned int		clone_blksize;	/* granularity of a CLONE operation */
 #define NFS_OPTION_FSCACHE	0x00000001	/* - local caching enabled */
 #define NFS_OPTION_MIGRATION	0x00000002	/* - NFSv4 migration enabled */
 
@@ -173,6 +177,11 @@ struct nfs_server {
 						   set of attributes supported
 						   on this filesystem excluding
 						   the label support bit. */
+	u32			exclcreat_bitmask[3];
+						/* V4 bitmask representing the
+						   set of attributes supported
+						   on this filesystem for the
+						   exclusive create. */
 	u32			cache_consistency_bitmask[3];
 						/* V4 bitmask representing the subset
 						   of change attribute, size, ctime
@@ -237,5 +246,14 @@ struct nfs_server {
 #define NFS_CAP_SEEK		(1U << 19)
 #define NFS_CAP_ALLOCATE	(1U << 20)
 #define NFS_CAP_DEALLOCATE	(1U << 21)
+#define NFS_CAP_LAYOUTSTATS	(1U << 22)
+#define NFS_CAP_CLONE		(1U << 23)
+#define NFS_CAP_ALLOW_ACLS	(1U << 24)
+#define NFS_CAP_DENY_ACLS	(1U << 25)
+#define NFS_CAP_TIME_CREATE	(1U << 26)
+#define NFS_CAP_HIDDEN          (1U << 27)
+#define NFS_CAP_SYSTEM          (1U << 28)
+#define NFS_CAP_ARCHIVE         (1U << 29)
+#define NFS_CAP_TIME_BACKUP     (1U << 30)
 
 #endif
