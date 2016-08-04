@@ -31,10 +31,16 @@
 #include "xfs_cksum.h"
 #include "xfs_trace.h"
 
+/*
+ * XXX: kernel implementation causes ndquots calc to go real
+ * bad. Just leaving the existing userspace calc here right now.
+ */
 int
 xfs_calc_dquots_per_chunk(
 	unsigned int		nbblks)	/* basic block units */
 {
+#ifdef __KERNEL__
+	/* kernel code that goes wrong in userspace! */
 	unsigned int	ndquots;
 
 	ASSERT(nbblks > 0);
@@ -42,6 +48,10 @@ xfs_calc_dquots_per_chunk(
 	do_div(ndquots, sizeof(xfs_dqblk_t));
 
 	return ndquots;
+#else
+	ASSERT(nbblks > 0);
+	return BBTOB(nbblks) / sizeof(xfs_dqblk_t);
+#endif
 }
 
 /*
@@ -163,7 +173,7 @@ xfs_dqcheck(
 	d->dd_diskdq.d_id = cpu_to_be32(id);
 
 	if (xfs_sb_version_hascrc(&mp->m_sb)) {
-		uuid_copy(&d->dd_uuid, &mp->m_sb.sb_uuid);
+		uuid_copy(&d->dd_uuid, &mp->m_sb.sb_meta_uuid);
 		xfs_update_cksum((char *)d, sizeof(struct xfs_dqblk),
 				 XFS_DQUOT_CRC_OFF);
 	}
@@ -198,7 +208,7 @@ xfs_dquot_buf_verify_crc(
 		if (!xfs_verify_cksum((char *)d, sizeof(struct xfs_dqblk),
 				 XFS_DQUOT_CRC_OFF))
 			return false;
-		if (!uuid_equal(&d->dd_uuid, &mp->m_sb.sb_uuid))
+		if (!uuid_equal(&d->dd_uuid, &mp->m_sb.sb_meta_uuid))
 			return false;
 	}
 	return true;
@@ -301,11 +311,13 @@ xfs_dquot_buf_write_verify(
 }
 
 const struct xfs_buf_ops xfs_dquot_buf_ops = {
+	.name = "xfs_dquot",
 	.verify_read = xfs_dquot_buf_read_verify,
 	.verify_write = xfs_dquot_buf_write_verify,
 };
 
 const struct xfs_buf_ops xfs_dquot_buf_ra_ops = {
+	.name = "xfs_dquot_ra",
 	.verify_read = xfs_dquot_buf_readahead_verify,
 	.verify_write = xfs_dquot_buf_write_verify,
 };
