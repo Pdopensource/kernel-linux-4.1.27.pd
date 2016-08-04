@@ -20,7 +20,6 @@
 
 struct inode;
 struct posix_acl;
-struct xfs_inode;
 
 #ifdef CONFIG_XFS_POSIX_ACL
 extern struct posix_acl *xfs_get_acl(struct inode *inode, int type);
@@ -32,4 +31,7 @@ static inline struct posix_acl *xfs_get_acl(struct inode *inode, int type)
 }
 # define xfs_set_acl					NULL
 #endif /* CONFIG_XFS_POSIX_ACL */
+
+extern void xfs_forget_acl(struct inode *inode, const char *name, int xflags);
+
 #endif	/* __XFS_ACL_H__ */

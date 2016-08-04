@@ -231,14 +231,16 @@ xfs_fs_get_dqblk(
 	struct qc_dqblk		*qdq)
 {
 	struct xfs_mount	*mp = XFS_M(sb);
+	xfs_dqid_t		id;
 
 	if (!XFS_IS_QUOTA_RUNNING(mp))
 		return -ENOSYS;
 	if (!XFS_IS_QUOTA_ON(mp))
 		return -ESRCH;
 
-	return xfs_qm_scall_getquota(mp, from_kqid(&init_user_ns, qid),
-				      xfs_quota_type(qid.type), qdq);
+	id = from_kqid(&init_user_ns, qid);
+	return xfs_qm_scall_getquota(mp, &id,
+				      xfs_quota_type(qid.type), qdq, 0);
 }
 
 STATIC int
