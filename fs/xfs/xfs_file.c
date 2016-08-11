@@ -316,7 +316,7 @@ xfs_file_dio_aio_read(
 	}
 
 	data = *to;
-	ret = __blockdev_direct_IO(iocb, inode, target->bt_bdev, &data, 0,
+	ret = __blockdev_direct_IO(iocb, inode, target->bt_bdev, &data, iocb->ki_pos,
 			xfs_get_blocks_direct, NULL, NULL, 0);
 	if (ret > 0) {
 		iocb->ki_pos += ret;
@@ -668,7 +668,7 @@ xfs_file_dio_aio_write(
 	trace_xfs_file_direct_write(ip, count, iocb->ki_pos);
 
 	data = *from;
-	ret = __blockdev_direct_IO(iocb, inode, target->bt_bdev, &data, 0,
+	ret = __blockdev_direct_IO(iocb, inode, target->bt_bdev, &data, iocb->ki_pos,
 			xfs_get_blocks_direct, xfs_end_io_direct_write,
 			NULL, DIO_ASYNC_EXTEND);
 

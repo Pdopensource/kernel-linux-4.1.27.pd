@@ -264,7 +264,7 @@ xfs_end_io(
 	struct xfs_ioend	*ioend =
 		container_of(work, struct xfs_ioend, io_work);
 	struct xfs_inode	*ip = XFS_I(ioend->io_inode);
-	int			error = 0; /* FIXME ioend->io_bio->bi_error; */
+	int			error = ioend->io_error;
 
 	/*
 	 * Set an error if the mount has shut down and proceed with end I/O
@@ -279,13 +279,11 @@ xfs_end_io(
 	 * new blocks.
 	 */
 	if (ioend->io_type == XFS_IO_COW) {
-#ifdef FIXME
-		if (ioend->io_bio->bi_error) {
+		if (ioend->io_error) {
 			error = xfs_reflink_cancel_cow_range(ip,
 					ioend->io_offset, ioend->io_size);
 			goto done;
 		}
-#endif
 		error = xfs_reflink_end_cow(ip, ioend->io_offset,
 				ioend->io_size);
 		if (error)
@@ -323,12 +321,14 @@ xfs_end_bio(
 	struct xfs_ioend	*ioend = bio->bi_private;
 	struct xfs_mount	*mp = XFS_I(ioend->io_inode)->i_mount;
 
+	ioend->io_error = test_bit(BIO_UPTODATE, &bio->bi_flags) ? 0 : error;
+
 	if (ioend->io_type == XFS_IO_UNWRITTEN || ioend->io_type == XFS_IO_COW)
 		queue_work(mp->m_unwritten_workqueue, &ioend->io_work);
 	else if (ioend->io_append_trans)
 		queue_work(mp->m_data_workqueue, &ioend->io_work);
 	else
-		xfs_destroy_ioend(ioend, error);
+		xfs_destroy_ioend(ioend, ioend->io_error);
 }
 
 STATIC int
