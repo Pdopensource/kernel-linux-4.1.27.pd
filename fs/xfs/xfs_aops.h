@@ -44,6 +44,7 @@ enum {
 struct xfs_ioend {
 	struct list_head	io_list;	/* next ioend in chain */
 	unsigned int		io_type;	/* delalloc / unwritten */
+	int			io_error;
 	struct inode		*io_inode;	/* file being written to */
 	size_t			io_size;	/* size of the extent */
 	xfs_off_t		io_offset;	/* offset in the file */
